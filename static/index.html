@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Streamer</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>Video Streamer</h1>
+        <div class="header-right">
+            <div id="status"></div>
+            <button id="settings-btn" onclick="toggleSettings()" title="Settings">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+                </svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Settings Panel -->
+    <div id="settings-overlay" class="hidden" onclick="toggleSettings()"></div>
+    <div id="settings-panel" class="hidden">
+        <div class="settings-header">
+            <h2>Settings</h2>
+            <button class="close-btn" onclick="toggleSettings()">&times;</button>
+        </div>
+        <div class="settings-body">
+            <div class="form-group">
+                <label for="input-video-dir">Video Directory</label>
+                <input type="text" id="input-video-dir" placeholder="/path/to/videos">
+                <span class="hint">Local path containing video files</span>
+            </div>
+            <div class="form-group">
+                <label for="input-cache-dir">Cache Directory</label>
+                <input type="text" id="input-cache-dir" placeholder="/path/to/cache">
+                <span class="hint">Transcoded HLS segments storage</span>
+            </div>
+            <div class="form-group">
+                <label for="input-max-cache">Max Cache Size (GB)</label>
+                <input type="number" id="input-max-cache" min="1" max="500" value="50">
+                <span class="hint">Old cache auto-cleaned when exceeded</span>
+            </div>
+            <button id="save-btn" class="primary-btn" onclick="saveSettings()">Save</button>
+            <div id="settings-msg" class="hidden"></div>
+        </div>
+    </div>
+
+    <main>
+        <!-- 视频库 -->
+        <section id="library" class="active">
+            <div id="video-grid"></div>
+            <div id="loading">Loading...</div>
+        </section>
+
+        <!-- 播放器 -->
+        <section id="player-section" class="hidden">
+            <button id="back-btn" onclick="goBack()">&#8592; Back</button>
+            <div class="player-wrapper">
+                <video id="video-player" controls></video>
+            </div>
+            <div id="video-info"></div>
+            <div id="quality-selector">
+                <label>Quality:</label>
+                <select id="quality-select" onchange="switchQuality(this.value)">
+                </select>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/player.js"></script>
+</body>
+</html>
