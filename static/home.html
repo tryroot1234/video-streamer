@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Streamer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="home-container">
+        <div class="home-card">
+            <h1>Video Streamer</h1>
+            <p class="subtitle">Self-hosted video streaming with real-time transcoding</p>
+
+            <div class="url-section">
+                <label>Access URL</label>
+                <div class="url-row">
+                    <input type="text" id="access-url" readonly>
+                    <button id="copy-btn" onclick="copyUrl()" title="Copy">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                    </button>
+                </div>
+                <span id="copy-msg" class="copy-msg"></span>
+            </div>
+
+            <a href="/library" class="enter-btn">Enter Video Library</a>
+        </div>
+    </div>
+
+    <script>
+        const url = window.location.origin;
+        document.getElementById("access-url").value = url;
+
+        async function copyUrl() {
+            try {
+                await navigator.clipboard.writeText(url);
+                const msg = document.getElementById("copy-msg");
+                msg.textContent = "Copied!";
+                setTimeout(() => msg.textContent = "", 2000);
+            } catch {
+                const input = document.getElementById("access-url");
+                input.select();
+                document.execCommand("copy");
+                const msg = document.getElementById("copy-msg");
+                msg.textContent = "Copied!";
+                setTimeout(() => msg.textContent = "", 2000);
+            }
+        }
+    </script>
+</body>
+</html>

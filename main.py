@@ -64,7 +64,13 @@ async def api_update_settings(body: SettingsUpdate):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = Path(__file__).parent / "static" / "index.html"
+    html_path = Path(__file__).parent / "static" / "home.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/library", response_class=HTMLResponse)
+async def library():
+    html_path = Path(__file__).parent / "static" / "library.html"
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
