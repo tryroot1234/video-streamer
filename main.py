@@ -162,8 +162,70 @@ async def api_thumbnail(video_id: str):
 
 @app.get("/api/cache/status")
 async def api_cache_status():
-    from cache_manager import get_cache_size
-    return {"size_bytes": get_cache_size()}
+    from cache_manager import get_cache_size, get_disk_status
+    return {"size_bytes": get_cache_size(), "disk": get_disk_status()}
+
+
+@app.get("/api/disk/status")
+async def api_disk_status():
+    from cache_manager import get_disk_status, get_cache_size, can_cache_more
+    disk = get_disk_status()
+    cache_size = get_cache_size()
+    max_bytes = config.get("max_cache_size_gb") * 1024 * 1024 * 1024
+    can, reason = can_cache_more()
+    return {
+        **disk,
+        "cache_size": cache_size,
+        "max_cache_size": max_bytes,
+        "can_cache_more": can,
+        "stop_reason": reason,
+    }
+
+
+@app.post("/api/cache/init")
+async def api_cache_init():
+    from cache_manager import start_batch_cache, get_batch_state
+    videos = refresh_videos()
+    if get_batch_state()["running"]:
+        return {"ok": False, "msg": "批量缓存已在运行中"}
+    ok = start_batch_cache(videos, get_or_start_transcode)
+    return {"ok": ok}
+
+
+@app.post("/api/cache/stop")
+async def api_cache_stop():
+    from cache_manager import stop_batch_cache
+    stop_batch_cache()
+    return {"ok": True}
+
+
+@app.get("/api/cache/batch")
+async def api_cache_batch():
+    from cache_manager import get_batch_state
+    return get_batch_state()
+
+
+@app.get("/api/video/{video_id}/cache-status")
+async def api_video_cache_status(video_id: str):
+    from cache_manager import get_cached_qualities
+    return {"video_id": video_id, "cached_qualities": get_cached_qualities(video_id)}
+
+
+@app.post("/api/cache/evict-and-start")
+async def api_evict_and_start(video_id: str, quality: str = "720p"):
+    """淘汰最旧缓存并开始转码指定视频"""
+    from cache_manager import evict_oldest, check_disk_for_new_cache
+    refresh_videos()
+    video = _video_cache.get(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    ok, reason = check_disk_for_new_cache()
+    if not ok:
+        return {"ok": False, "msg": reason}
+
+    evict_oldest()
+    return {"ok": True}
 
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")

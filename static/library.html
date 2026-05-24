@@ -57,19 +57,37 @@
     <main>
         <!-- 排序和分页控件 -->
         <div class="toolbar" id="toolbar">
-            <div class="sort-group">
-                <label>排序:</label>
-                <select id="sort-select" onchange="changeSort(this.value)">
-                    <option value="name-asc">名称 A-Z</option>
-                    <option value="name-desc">名称 Z-A</option>
-                    <option value="time-desc" selected>最新优先</option>
-                    <option value="time-asc">最早优先</option>
-                    <option value="size-desc">最大优先</option>
-                    <option value="size-asc">最小优先</option>
-                </select>
+            <div class="toolbar-left">
+                <div class="sort-group">
+                    <label>排序:</label>
+                    <select id="sort-select" onchange="changeSort(this.value)">
+                        <option value="name-asc">名称 A-Z</option>
+                        <option value="name-desc">名称 Z-A</option>
+                        <option value="time-desc" selected>最新优先</option>
+                        <option value="time-asc">最早优先</option>
+                        <option value="size-desc">最大优先</option>
+                        <option value="size-asc">最小优先</option>
+                    </select>
+                </div>
+                <button id="cache-init-btn" class="cache-btn" onclick="startBatchCache()">一键缓存全部</button>
+                <button id="cache-stop-btn" class="cache-btn cache-btn-stop hidden" onclick="stopBatchCache()">停止缓存</button>
             </div>
             <div class="page-info" id="page-info"></div>
         </div>
+
+        <!-- 批量缓存进度 -->
+        <div id="batch-progress" class="batch-progress hidden">
+            <div class="batch-info">
+                <span id="batch-status"></span>
+                <span id="batch-current"></span>
+            </div>
+            <div class="progress-bar">
+                <div id="progress-fill" class="progress-fill"></div>
+            </div>
+        </div>
+
+        <!-- 磁盘空间提示 -->
+        <div id="disk-warning" class="disk-warning hidden"></div>
 
         <!-- 视频库 -->
         <section id="library" class="active">
@@ -94,6 +112,34 @@
             </div>
         </section>
     </main>
+
+    <!-- 缓存决策弹窗 -->
+    <div id="cache-modal-overlay" class="modal-overlay hidden" onclick="closeCacheModal()"></div>
+    <div id="cache-modal" class="modal hidden">
+        <div class="modal-header">
+            <h3>缓存不足</h3>
+            <button class="close-btn" onclick="closeCacheModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p id="cache-modal-msg"></p>
+            <div class="modal-actions">
+                <button class="primary-btn" onclick="expandCacheAndPlay()">更改最大缓存大小</button>
+                <button class="secondary-btn" onclick="evictAndPlay()">覆盖最早缓存并播放</button>
+            </div>
+            <div id="cache-modal-expand" class="hidden">
+                <div class="form-group">
+                    <label>新的最大缓存大小 (GB)</label>
+                    <input type="number" id="new-max-cache" min="1" max="500">
+                    <span id="cache-modal-hint" class="hint"></span>
+                </div>
+                <div class="modal-actions">
+                    <button class="primary-btn" onclick="confirmExpandAndPlay()">确认并播放</button>
+                    <button class="secondary-btn" onclick="closeCacheModal()">取消</button>
+                </div>
+            </div>
+            <div id="cache-modal-msg2" class="hidden"></div>
+        </div>
+    </div>
 
     <script src="/static/library.js"></script>
 </body>

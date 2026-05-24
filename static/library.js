@@ -7,6 +7,9 @@ let currentPage = 1;
 let perPage = 20;
 let currentSort = "time-desc";
 
+let batchPollTimer = null;
+let pendingPlayVideo = null;
+
 // ---------- Settings ----------
 
 async function loadSettings() {
@@ -220,14 +223,203 @@ function renderPagination(totalPages, totalItems) {
     container.innerHTML = html;
 }
 
+// ---------- Batch Cache ----------
+
+async function startBatchCache() {
+    try {
+        const res = await fetch("/api/cache/init", {method: "POST"});
+        const data = await res.json();
+        if (!data.ok) {
+            alert(data.msg);
+            return;
+        }
+        document.getElementById("cache-init-btn").classList.add("hidden");
+        document.getElementById("cache-stop-btn").classList.remove("hidden");
+        document.getElementById("batch-progress").classList.remove("hidden");
+        pollBatchProgress();
+    } catch (e) {
+        alert("启动批量缓存失败");
+    }
+}
+
+async function stopBatchCache() {
+    await fetch("/api/cache/stop", {method: "POST"});
+}
+
+function pollBatchProgress() {
+    if (batchPollTimer) clearInterval(batchPollTimer);
+    batchPollTimer = setInterval(async () => {
+        try {
+            const res = await fetch("/api/cache/batch");
+            const s = await res.json();
+
+            const statusEl = document.getElementById("batch-status");
+            const currentEl = document.getElementById("batch-current");
+            const fillEl = document.getElementById("progress-fill");
+
+            if (s.total > 0) {
+                const pct = Math.round(s.done / s.total * 100);
+                fillEl.style.width = pct + "%";
+                statusEl.textContent = `${s.done} / ${s.total} (${pct}%)`;
+            }
+
+            if (s.running) {
+                currentEl.textContent = s.current ? `正在缓存: ${s.current}` : "";
+            } else {
+                clearInterval(batchPollTimer);
+                batchPollTimer = null;
+                document.getElementById("cache-init-btn").classList.remove("hidden");
+                document.getElementById("cache-stop-btn").classList.add("hidden");
+
+                if (s.stopped_reason) {
+                    currentEl.textContent = s.stopped_reason;
+                }
+
+                // 检查磁盘状态
+                checkDiskStatus();
+            }
+        } catch (e) {
+            console.error("Poll batch progress error", e);
+        }
+    }, 2000);
+}
+
+// ---------- Disk Status ----------
+
+async function checkDiskStatus() {
+    try {
+        const res = await fetch("/api/disk/status");
+        const d = await res.json();
+        const warn = document.getElementById("disk-warning");
+
+        if (d.free_percent < 20) {
+            warn.textContent = `⚠ 磁盘可用空间不足 20% (剩余 ${d.free_percent}%)，请尽快扩容`;
+            warn.classList.remove("hidden");
+        } else if (!d.can_cache_more && d.stop_reason) {
+            warn.textContent = `⚠ ${d.stop_reason}`;
+            warn.classList.remove("hidden");
+        } else {
+            warn.classList.add("hidden");
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+// ---------- Cache Modal ----------
+
+async function showCacheModal(video) {
+    pendingPlayVideo = video;
+    const quality = video.recommended_quality;
+    const diskRes = await fetch("/api/disk/status");
+    const disk = await diskRes.json();
+
+    const msg = document.getElementById("cache-modal-msg");
+    msg.innerHTML = `视频 <strong>${video.name}</strong> 暂无缓存。<br><br>当前最大缓存: ${formatSize(disk.max_cache_size)}<br>已用缓存: ${formatSize(disk.cache_size)}<br>磁盘可用: ${disk.free_percent}%`;
+
+    document.getElementById("cache-modal-expand").classList.add("hidden");
+    document.getElementById("cache-modal-msg2").classList.add("hidden");
+    document.getElementById("cache-modal-overlay").classList.remove("hidden");
+    document.getElementById("cache-modal").classList.remove("hidden");
+}
+
+function closeCacheModal() {
+    document.getElementById("cache-modal-overlay").classList.add("hidden");
+    document.getElementById("cache-modal").classList.add("hidden");
+    document.getElementById("cache-modal-expand").classList.add("hidden");
+    document.getElementById("cache-modal-msg2").classList.add("hidden");
+    pendingPlayVideo = null;
+}
+
+async function expandCacheAndPlay() {
+    const diskRes = await fetch("/api/disk/status");
+    const disk = await diskRes.json();
+
+    if (disk.free_percent < 20) {
+        document.getElementById("cache-modal-msg2").textContent = `⚠ 磁盘可用空间不足 20% (剩余 ${disk.free_percent}%)，请先扩容磁盘空间`;
+        document.getElementById("cache-modal-msg2").className = "disk-warning";
+        document.getElementById("cache-modal-msg2").classList.remove("hidden");
+        return;
+    }
+
+    const maxAllowed = Math.floor((disk.total * 0.8 - (disk.used - disk.cache_size)) / 1073741824);
+    const currentMax = disk.max_cache_size / 1073741824;
+
+    document.getElementById("new-max-cache").value = Math.min(maxAllowed, currentMax + 50);
+    document.getElementById("cache-modal-hint").textContent = `磁盘 80% 容量限制下最大可设为 ${maxAllowed} GB`;
+    document.getElementById("cache-modal-expand").classList.remove("hidden");
+}
+
+async function confirmExpandAndPlay() {
+    const newMax = parseInt(document.getElementById("new-max-cache").value, 10);
+    if (!newMax || newMax < 1) return;
+
+    const diskRes = await fetch("/api/disk/status");
+    const disk = await diskRes.json();
+    const maxAllowed = Math.floor((disk.total * 0.8 - (disk.used - disk.cache_size)) / 1073741824);
+
+    if (newMax > maxAllowed) {
+        document.getElementById("cache-modal-msg2").textContent = `⚠ 设置值超过磁盘 80% 容量限制 (${maxAllowed} GB)，请先扩容磁盘空间`;
+        document.getElementById("cache-modal-msg2").className = "disk-warning";
+        document.getElementById("cache-modal-msg2").classList.remove("hidden");
+        return;
+    }
+
+    await fetch("/api/settings", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({max_cache_size_gb: newMax}),
+    });
+
+    closeCacheModal();
+    if (pendingPlayVideo) {
+        doPlay(pendingPlayVideo);
+    }
+}
+
+async function evictAndPlay() {
+    if (!pendingPlayVideo) return;
+    const video = pendingPlayVideo;
+
+    const res = await fetch(`/api/cache/evict-and-start?video_id=${encodeURIComponent(video.id)}&quality=${video.recommended_quality}`, {method: "POST"});
+    const data = await res.json();
+
+    if (!data.ok) {
+        document.getElementById("cache-modal-msg2").textContent = `⚠ ${data.msg}`;
+        document.getElementById("cache-modal-msg2").className = "disk-warning";
+        document.getElementById("cache-modal-msg2").classList.remove("hidden");
+        return;
+    }
+
+    closeCacheModal();
+    doPlay(video);
+}
+
 // ---------- Player ----------
 
-function playVideo(video) {
+async function playVideo(video) {
+    const quality = video.recommended_quality;
+    try {
+        const res = await fetch(`/api/video/${encodeURIComponent(video.id)}/cache-status`);
+        const data = await res.json();
+        if (!data.cached_qualities.includes(quality)) {
+            showCacheModal(video);
+            return;
+        }
+    } catch (e) {
+        // 如果检查失败，直接播放
+    }
+    doPlay(video);
+}
+
+function doPlay(video) {
     currentVideo = video;
     document.getElementById("library").classList.add("hidden");
     document.getElementById("player-section").classList.remove("hidden");
     document.getElementById("toolbar").classList.add("hidden");
     document.getElementById("pagination").classList.add("hidden");
+    document.getElementById("batch-progress").classList.add("hidden");
+    document.getElementById("disk-warning").classList.add("hidden");
 
     const select = document.getElementById("quality-select");
     select.innerHTML = "";
@@ -315,8 +507,11 @@ function goBack() {
     document.getElementById("toolbar").classList.remove("hidden");
     document.getElementById("pagination").classList.remove("hidden");
     currentVideo = null;
+
+    checkDiskStatus();
 }
 
 // ---------- Init ----------
 
 loadVideos();
+checkDiskStatus();
