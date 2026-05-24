@@ -132,6 +132,8 @@ _batch_state = {
     "total": 0,
     "done": 0,
     "current": "",
+    "current_video_id": "",
+    "video_progress": {},  # {video_id: {"percent": 0-100, "status": "caching"|"done"|"error"|"pending"}}
     "stopped_reason": "",
     "errors": [],
 }
@@ -143,16 +145,29 @@ def get_batch_state() -> dict:
         return dict(_batch_state)
 
 
-def start_batch_cache(videos: list[dict], transcode_fn):
-    """启动批量缓存。transcode_fn(video_path, video_id, quality) -> job"""
+def get_video_progress(video_id: str) -> dict:
+    with _batch_lock:
+        return _batch_state["video_progress"].get(video_id, {"percent": 0, "status": "pending"})
+
+
+def start_batch_cache(videos: list[dict]):
+    """启动批量缓存，按传入的视频列表顺序执行"""
     with _batch_lock:
         if _batch_state["running"]:
             return False
+        progress = {}
+        for v in videos:
+            if is_cached(v["id"], v.get("recommended_quality", "720p")):
+                progress[v["id"]] = {"percent": 100, "status": "done"}
+            else:
+                progress[v["id"]] = {"percent": 0, "status": "pending"}
         _batch_state.update({
             "running": True,
             "total": len(videos),
             "done": 0,
             "current": "",
+            "current_video_id": "",
+            "video_progress": progress,
             "stopped_reason": "",
             "errors": [],
         })
@@ -165,7 +180,6 @@ def start_batch_cache(videos: list[dict], transcode_fn):
                     _batch_state["stopped_reason"] = "用户手动停止"
                     break
 
-            # 检查磁盘空间
             can, reason = can_cache_more()
             if not can:
                 with _batch_lock:
@@ -178,20 +192,40 @@ def start_batch_cache(videos: list[dict], transcode_fn):
 
             if is_cached(vid, quality):
                 with _batch_lock:
+                    _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
                     _batch_state["done"] += 1
                 continue
 
             with _batch_lock:
                 _batch_state["current"] = v["name"]
+                _batch_state["current_video_id"] = vid
+                _batch_state["video_progress"][vid] = {"percent": 0, "status": "caching"}
 
             try:
                 job = get_or_start_transcode(v["path"], vid, quality)
-                job.wait_ready(timeout=600)
+
+                # 等待转码完成，同时更新进度
+                estimated_total = max(1, int(v.get("duration", 0) / config.HLS_SEGMENT_TIME))
+                while job.is_alive():
+                    with _batch_lock:
+                        if not _batch_state["running"]:
+                            break
+                    seg_count = job._segment_count()
+                    pct = min(99, int(seg_count / estimated_total * 100))
+                    with _batch_lock:
+                        _batch_state["video_progress"][vid] = {"percent": pct, "status": "caching"}
+                    time.sleep(1)
+
                 if job.error:
                     with _batch_lock:
+                        _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
                         _batch_state["errors"].append(v["name"])
+                else:
+                    with _batch_lock:
+                        _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
             except Exception as e:
                 with _batch_lock:
+                    _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
                     _batch_state["errors"].append(f"{v['name']}: {e}")
 
             with _batch_lock:
@@ -199,6 +233,7 @@ def start_batch_cache(videos: list[dict], transcode_fn):
 
         with _batch_lock:
             _batch_state["running"] = False
+            _batch_state["current_video_id"] = ""
             if not _batch_state["stopped_reason"]:
                 _batch_state["stopped_reason"] = "缓存完成"
 

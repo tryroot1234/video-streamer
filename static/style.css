@@ -264,6 +264,42 @@ main {
     font-size: 12px;
 }
 
+.video-card .cache-progress {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    background: rgba(0,0,0,0.5);
+}
+
+.video-card .cache-progress-bar {
+    height: 100%;
+    background: #4a6fa5;
+    width: 0%;
+    transition: width 0.5s;
+}
+
+.video-card .cache-progress-bar.done {
+    background: #6fcf97;
+}
+
+.video-card .cache-progress-bar.error {
+    background: #e57373;
+}
+
+.video-card .cache-pct {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    background: rgba(0,0,0,0.7);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #fff;
+    display: none;
+}
+
 #loading {
     text-align: center;
     padding: 60px;

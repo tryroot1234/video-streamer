@@ -183,13 +183,30 @@ async def api_disk_status():
 
 
 @app.post("/api/cache/init")
-async def api_cache_init():
+async def api_cache_init(request: Request):
     from cache_manager import start_batch_cache, get_batch_state
-    videos = refresh_videos()
+    body = await request.json()
+    video_ids = body.get("video_ids", [])
+
+    all_vids = refresh_videos()
+    if video_ids:
+        vid_map = {v["id"]: v for v in all_vids}
+        videos = [vid_map[vid] for vid in video_ids if vid in vid_map]
+    else:
+        videos = all_vids
+
     if get_batch_state()["running"]:
         return {"ok": False, "msg": "批量缓存已在运行中"}
-    ok = start_batch_cache(videos, get_or_start_transcode)
+    ok = start_batch_cache(videos)
     return {"ok": ok}
+
+
+@app.get("/api/video/{video_id}/transcode-progress")
+async def api_transcode_progress(video_id: str):
+    from cache_manager import get_video_progress, get_cached_qualities
+    progress = get_video_progress(video_id)
+    cached = get_cached_qualities(video_id)
+    return {"video_id": video_id, "progress": progress, "cached_qualities": cached}
 
 
 @app.post("/api/cache/stop")

@@ -177,6 +177,8 @@ function renderLibrary(videos) {
             <div class="thumb">
                 <img src="/api/video/${encodeURIComponent(v.id)}/thumbnail" onerror="this.style.display='none'" loading="lazy">
                 <span class="badge">${resLabel}</span>
+                <div class="cache-progress"><div class="cache-progress-bar" id="pgb-${v.id}"></div></div>
+                <span class="cache-pct" id="pgp-${v.id}"></span>
             </div>
             <div class="info">
                 <h3 title="${v.name}">${v.name}</h3>
@@ -233,7 +235,15 @@ function renderPagination(totalPages, totalItems) {
 
 async function startBatchCache() {
     try {
-        const res = await fetch("/api/cache/init", {method: "POST"});
+        // 按当前排序顺序发送视频 ID
+        const sorted = sortVideos(allVideos, currentSort);
+        const videoIds = sorted.map(v => v.id);
+
+        const res = await fetch("/api/cache/init", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({video_ids: videoIds}),
+        });
         const data = await res.json();
         if (!data.ok) {
             alert(data.msg);
@@ -269,6 +279,30 @@ function pollBatchProgress() {
                 statusEl.textContent = `${s.done} / ${s.total} (${pct}%)`;
             }
 
+            // 更新每个视频卡片的进度
+            if (s.video_progress) {
+                for (const [vid, prog] of Object.entries(s.video_progress)) {
+                    const bar = document.getElementById(`pgb-${vid}`);
+                    const pctEl = document.getElementById(`pgp-${vid}`);
+                    if (bar && pctEl) {
+                        bar.style.width = prog.percent + "%";
+                        if (prog.status === "caching") {
+                            pctEl.textContent = prog.percent + "%";
+                            pctEl.style.display = "block";
+                            bar.className = "cache-progress-bar";
+                        } else if (prog.status === "done") {
+                            pctEl.textContent = "已缓存";
+                            pctEl.style.display = "block";
+                            bar.className = "cache-progress-bar done";
+                        } else if (prog.status === "error") {
+                            pctEl.textContent = "失败";
+                            pctEl.style.display = "block";
+                            bar.className = "cache-progress-bar error";
+                        }
+                    }
+                }
+            }
+
             if (s.running) {
                 currentEl.textContent = s.current ? `正在缓存: ${s.current}` : "";
             } else {
@@ -281,13 +315,12 @@ function pollBatchProgress() {
                     currentEl.textContent = s.stopped_reason;
                 }
 
-                // 检查磁盘状态
                 checkDiskStatus();
             }
         } catch (e) {
             console.error("Poll batch progress error", e);
         }
-    }, 2000);
+    }, 1000);
 }
 
 // ---------- Disk Status ----------
