@@ -4,7 +4,7 @@ let currentQuality = null;
 
 let allVideos = [];
 let currentPage = 1;
-let perPage = 20;
+let perPage = 12;
 let currentSort = "time-desc";
 
 let batchPollTimer = null;
@@ -122,6 +122,12 @@ function applySortAndRender() {
 
 function changeSort(value) {
     currentSort = value;
+    currentPage = 1;
+    applySortAndRender();
+}
+
+function changePerPage(value) {
+    perPage = parseInt(value, 10);
     currentPage = 1;
     applySortAndRender();
 }

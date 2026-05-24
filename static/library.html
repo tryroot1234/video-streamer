@@ -71,6 +71,15 @@
                 </div>
                 <button id="cache-init-btn" class="cache-btn" onclick="startBatchCache()">一键缓存全部</button>
                 <button id="cache-stop-btn" class="cache-btn cache-btn-stop hidden" onclick="stopBatchCache()">停止缓存</button>
+                <div class="sort-group">
+                    <label>每页:</label>
+                    <select id="perpage-select" onchange="changePerPage(this.value)">
+                        <option value="12" selected>12</option>
+                        <option value="20">20</option>
+                        <option value="30">30</option>
+                        <option value="50">50</option>
+                    </select>
+                </div>
             </div>
             <div class="page-info" id="page-info"></div>
         </div>
