@@ -40,12 +40,12 @@ async function saveSettings() {
             body: JSON.stringify(body),
         });
         if (!res.ok) throw new Error(await res.text());
-        msg.textContent = "Saved. Refreshing video list...";
+        msg.textContent = "已保存，正在刷新视频列表...";
         msg.className = "success";
         msg.classList.remove("hidden");
         loadVideos();
     } catch (e) {
-        msg.textContent = "Save failed: " + e.message;
+        msg.textContent = "保存失败: " + e.message;
         msg.className = "error";
         msg.classList.remove("hidden");
     } finally {
@@ -76,7 +76,7 @@ async function loadVideos() {
         allVideos = data.videos;
         applySortAndRender();
     } catch (e) {
-        document.getElementById("loading").textContent = "Failed to load videos";
+        document.getElementById("loading").textContent = "加载视频失败";
     }
 }
 
@@ -148,7 +148,7 @@ function renderLibrary(videos) {
     const loading = document.getElementById("loading");
 
     if (allVideos.length === 0) {
-        loading.textContent = "No videos found. Click the gear icon to set the video directory.";
+        loading.textContent = "未找到视频，请点击右上角齿轮图标设置视频目录";
         loading.classList.remove("hidden");
         grid.innerHTML = "";
         return;
@@ -188,11 +188,11 @@ function renderPagination(totalPages, totalItems) {
 
     if (totalPages <= 1) {
         container.innerHTML = "";
-        pageInfo.textContent = `${totalItems} videos`;
+        pageInfo.textContent = `共 ${totalItems} 个视频`;
         return;
     }
 
-    pageInfo.textContent = `${totalItems} videos · Page ${currentPage}/${totalPages}`;
+    pageInfo.textContent = `共 ${totalItems} 个视频 · 第 ${currentPage}/${totalPages} 页`;
 
     let html = "";
     html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(${currentPage - 1})">&laquo;</button>`;
@@ -287,7 +287,7 @@ function switchQuality(quality) {
         hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) {
                 console.error("HLS fatal error:", data);
-                document.getElementById("status").textContent = "Stream error";
+                document.getElementById("status").textContent = "流媒体错误";
             }
         });
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -297,7 +297,7 @@ function switchQuality(quality) {
             video.play().catch(() => {});
         });
     } else {
-        document.getElementById("status").textContent = "HLS not supported in this browser";
+        document.getElementById("status").textContent = "当前浏览器不支持 HLS";
     }
 }
 
