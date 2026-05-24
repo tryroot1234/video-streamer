@@ -1,8 +1,14 @@
+import math
+import re
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import config
+
+MAX_CONCURRENT_TRANSCODE = 5
+_transcode_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSCODE)
 
 
 def get_cache_size() -> int:
@@ -108,8 +114,37 @@ def get_video_cache_dir(video_id: str, quality: str) -> Path:
     return Path(config.get("cache_dir")) / video_id / quality
 
 
-def is_cached(video_id: str, quality: str) -> bool:
-    playlist = get_video_cache_dir(video_id, quality) / "playlist.m3u8"
+def is_cached(video_id: str, quality: str, duration: float = None) -> bool:
+    """检查视频是否已完整缓存。
+
+    有 duration 时：检查最大 segment 编号是否覆盖完整时长。
+    无 duration 时：回退到检查 playlist.m3u8 是否存在。
+    """
+    cache_dir = get_video_cache_dir(video_id, quality)
+    if not cache_dir.exists():
+        return False
+
+    segs = list(cache_dir.glob("seg_*.ts"))
+    seek_segs = list(cache_dir.glob("seek_*_*.ts"))
+    all_segs = segs + seek_segs
+    if not all_segs:
+        return False
+
+    if duration:
+        max_idx = 0
+        for s in segs:
+            m = re.match(r"seg_(\d+)\.ts", s.name)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+        for s in seek_segs:
+            m = re.match(r"seek_(\d+)_(\d+)\.ts", s.name)
+            if m:
+                abs_idx = int(m.group(1)) // config.HLS_SEGMENT_TIME + int(m.group(2))
+                max_idx = max(max_idx, abs_idx)
+        expected = math.ceil(duration / config.HLS_SEGMENT_TIME)
+        return max_idx >= expected - 1
+
+    playlist = cache_dir / "playlist.m3u8"
     return playlist.exists() and playlist.stat().st_size > 0
 
 
@@ -123,6 +158,26 @@ def get_cached_qualities(video_id: str) -> list[str]:
         if d.is_dir() and (d / "playlist.m3u8").exists():
             qualities.append(d.name)
     return qualities
+
+
+def clear_video_cache(video_id: str) -> dict:
+    """清除指定视频的所有缓存分片，保留缩略图"""
+    from transcoder import invalidate_jobs
+    cache_dir = Path(config.get("cache_dir")) / video_id
+    if not cache_dir.exists():
+        invalidate_jobs(video_id)
+        return {"ok": True, "freed": 0, "msg": "无缓存"}
+
+    freed = 0
+    for d in cache_dir.iterdir():
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink(missing_ok=True)
+            d.rmdir()
+    invalidate_jobs(video_id)
+    return {"ok": True, "freed": freed}
 
 
 # ---------- 批量缓存 ----------
@@ -157,7 +212,7 @@ def start_batch_cache(videos: list[dict]):
             return False
         progress = {}
         for v in videos:
-            if is_cached(v["id"], v.get("recommended_quality", "720p")):
+            if is_cached(v["id"], v.get("recommended_quality", "720p"), v.get("duration")):
                 progress[v["id"]] = {"percent": 100, "status": "done"}
             else:
                 progress[v["id"]] = {"percent": 0, "status": "pending"}
@@ -172,64 +227,79 @@ def start_batch_cache(videos: list[dict]):
             "errors": [],
         })
 
-    def _run():
+    def _transcode_one(v: dict):
         from transcoder import get_or_start_transcode
-        for v in videos:
+        vid = v["id"]
+        quality = v.get("recommended_quality", "720p")
+
+        if is_cached(vid, quality, v.get("duration")):
             with _batch_lock:
-                if not _batch_state["running"]:
-                    _batch_state["stopped_reason"] = "用户手动停止"
-                    break
+                _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
+                _batch_state["done"] += 1
+            return
 
-            can, reason = can_cache_more()
-            if not can:
-                with _batch_lock:
-                    _batch_state["running"] = False
-                    _batch_state["stopped_reason"] = reason
-                break
+        with _batch_lock:
+            if not _batch_state["running"]:
+                _batch_state["video_progress"][vid] = {"percent": 0, "status": "pending"}
+                return
+            _batch_state["video_progress"][vid] = {"percent": 0, "status": "caching"}
 
-            vid = v["id"]
-            quality = v.get("recommended_quality", "720p")
-
-            if is_cached(vid, quality):
-                with _batch_lock:
-                    _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
-                    _batch_state["done"] += 1
-                continue
-
+        can, reason = can_cache_more()
+        if not can:
             with _batch_lock:
-                _batch_state["current"] = v["name"]
-                _batch_state["current_video_id"] = vid
-                _batch_state["video_progress"][vid] = {"percent": 0, "status": "caching"}
+                _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
+                _batch_state["errors"].append(f"{v['name']}: {reason}")
+                _batch_state["done"] += 1
+            return
 
-            try:
-                job = get_or_start_transcode(v["path"], vid, quality)
+        # 获取信号量后启动转码，启动完成后立即释放
+        _transcode_semaphore.acquire()
+        try:
+            job = get_or_start_transcode(v["path"], vid, quality)
+        finally:
+            _transcode_semaphore.release()
 
-                # 等待转码完成，同时更新进度
-                estimated_total = max(1, int(v.get("duration", 0) / config.HLS_SEGMENT_TIME))
-                while job.is_alive():
-                    with _batch_lock:
-                        if not _batch_state["running"]:
-                            break
+        # 监控进度（信号量已释放，其他任务可以并发）
+        try:
+            estimated_total = max(1, int(v.get("duration", 0) / config.HLS_SEGMENT_TIME))
+            while job.is_alive():
+                with _batch_lock:
+                    if not _batch_state["running"]:
+                        break
+                if not job.paused:
                     seg_count = job._segment_count()
                     pct = min(99, int(seg_count / estimated_total * 100))
                     with _batch_lock:
-                        _batch_state["video_progress"][vid] = {"percent": pct, "status": "caching"}
-                    time.sleep(1)
+                        if _batch_state["video_progress"].get(vid, {}).get("status") != "paused":
+                            _batch_state["video_progress"][vid] = {"percent": pct, "status": "caching"}
+                time.sleep(1)
 
-                if job.error:
-                    with _batch_lock:
-                        _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
-                        _batch_state["errors"].append(v["name"])
-                else:
-                    with _batch_lock:
-                        _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
-            except Exception as e:
+            if job.error:
                 with _batch_lock:
                     _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
-                    _batch_state["errors"].append(f"{v['name']}: {e}")
-
+                    _batch_state["errors"].append(v["name"])
+            else:
+                with _batch_lock:
+                    _batch_state["video_progress"][vid] = {"percent": 100, "status": "done"}
+        except Exception as e:
             with _batch_lock:
-                _batch_state["done"] += 1
+                _batch_state["video_progress"][vid] = {"percent": 0, "status": "error"}
+                _batch_state["errors"].append(f"{v['name']}: {e}")
+
+        with _batch_lock:
+            _batch_state["done"] += 1
+
+    def _run():
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TRANSCODE) as pool:
+            futures = {pool.submit(_transcode_one, v): v for v in videos}
+            for future in as_completed(futures):
+                with _batch_lock:
+                    if not _batch_state["running"]:
+                        break
+                try:
+                    future.result()
+                except Exception:
+                    pass
 
         with _batch_lock:
             _batch_state["running"] = False
@@ -244,6 +314,47 @@ def start_batch_cache(videos: list[dict]):
 def stop_batch_cache():
     with _batch_lock:
         _batch_state["running"] = False
+
+
+def _find_job(video_id: str):
+    from transcoder import get_job, _jobs, _jobs_lock
+    # Try recommended quality first
+    job = get_job(video_id, "720p")
+    if not job:
+        with _jobs_lock:
+            for key, j in _jobs.items():
+                if j.video_id == video_id and not j.finished:
+                    job = j
+                    break
+    return job
+
+
+def pause_batch_video(video_id: str) -> bool:
+    with _batch_lock:
+        prog = _batch_state["video_progress"].get(video_id)
+        if not prog or prog["status"] != "caching":
+            return False
+    job = _find_job(video_id)
+    if job and job.pause():
+        with _batch_lock:
+            if video_id in _batch_state["video_progress"]:
+                _batch_state["video_progress"][video_id]["status"] = "paused"
+        return True
+    return False
+
+
+def resume_batch_video(video_id: str) -> bool:
+    with _batch_lock:
+        prog = _batch_state["video_progress"].get(video_id)
+        if not prog or prog["status"] != "paused":
+            return False
+    job = _find_job(video_id)
+    if job and job.resume():
+        with _batch_lock:
+            if video_id in _batch_state["video_progress"]:
+                _batch_state["video_progress"][video_id]["status"] = "caching"
+        return True
+    return False
 
 
 def _fmt(b: int) -> str:

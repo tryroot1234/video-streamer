@@ -1,5 +1,9 @@
 import asyncio
+import glob
+import os
 import re
+import signal
+import subprocess
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -11,14 +15,51 @@ from pydantic import BaseModel
 
 import config
 from video_scanner import scan_videos
-from transcoder import get_or_start_transcode
+from transcoder import get_or_start_transcode, get_or_create_seekable, get_seekable_job, generate_full_m3u8
 from cache_manager import is_cached
+
+
+def cleanup_old_processes():
+    """清理上一次服务器遗留的 ffmpeg 进程"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "ffmpeg.*videotoolbox"],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split("\n")
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+            print(f"Cleaned up {len(pids)} old ffmpeg processes")
+    except Exception:
+        pass
+
+
+def cleanup_orphaned_seek_files():
+    """清理缓存目录中孤立的 seek 分片文件"""
+    cache_dir = Path(config.get("cache_dir"))
+    if not cache_dir.exists():
+        return
+    cleaned = 0
+    for seek_ts in cache_dir.rglob("seek_*_*.ts"):
+        seek_ts.unlink(missing_ok=True)
+        cleaned += 1
+    for seek_m3u8 in cache_dir.rglob("seek_*.m3u8"):
+        seek_m3u8.unlink(missing_ok=True)
+        cleaned += 1
+    if cleaned:
+        print(f"Cleaned up {cleaned} orphaned seek files")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.load_settings()
     Path(config.get("cache_dir")).mkdir(parents=True, exist_ok=True)
+    cleanup_old_processes()
+    cleanup_orphaned_seek_files()
     asyncio.get_event_loop().run_in_executor(None, refresh_videos)
     yield
 
@@ -89,11 +130,9 @@ async def api_video_info(video_id: str):
     return video
 
 
-def rewrite_m3u8(content: str, video_id: str, quality: str, add_endlist: bool = False) -> str:
+def rewrite_m3u8(content: str, video_id: str, quality: str) -> str:
     prefix = f"/api/video/{video_id}/stream/{quality}/"
     content = re.sub(r"(seg_\d+\.ts)", prefix + r"\1", content)
-    if add_endlist and "#EXT-X-ENDLIST" not in content:
-        content = content.rstrip() + "\n#EXT-X-ENDLIST\n"
     return content
 
 
@@ -104,38 +143,72 @@ async def api_stream(video_id: str, quality: str, request: Request):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    ua = request.headers.get("user-agent", "")
-    is_safari = "Safari" in ua and "Chrome" not in ua
+    # 如果没有足够分片，启动转码并等待
+    if not is_cached(video_id, quality, video.get("duration")):
+        job = get_or_start_transcode(video["path"], video_id, quality)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, job.wait_ready, 30.0)
 
-    # 已有完整缓存
-    if is_cached(video_id, quality):
-        playlist = Path(config.get("cache_dir")) / video_id / quality / "playlist.m3u8"
-        content = playlist.read_text(encoding="utf-8")
-        return Response(
-            content=rewrite_m3u8(content, video_id, quality, add_endlist=is_safari),
-            media_type="application/vnd.apple.mpegurl",
-        )
-
-    # 启动转码并等待分片就绪
-    job = get_or_start_transcode(video["path"], video_id, quality)
-    loop = asyncio.get_event_loop()
-    ready = await loop.run_in_executor(None, job.wait_ready, 30.0)
-
-    if not ready:
-        raise HTTPException(status_code=503, detail="Transcode failed or timeout")
-
-    content = job.playlist.read_text(encoding="utf-8")
+    # 动态生成完整 m3u8
+    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0))
     return Response(
-        content=rewrite_m3u8(content, video_id, quality, add_endlist=is_safari),
+        content=m3u8,
         media_type="application/vnd.apple.mpegurl",
     )
 
 
+@app.post("/api/video/{video_id}/seek/{quality}")
+async def api_seek(video_id: str, quality: str, request: Request):
+    """从指定位置开始新的转码"""
+    body = await request.json()
+    position = body.get("position", 0)
+    if position <= 0:
+        return {"ok": False, "msg": "Invalid position"}
+
+    refresh_videos()
+    video = _video_cache.get(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    loop = asyncio.get_event_loop()
+    seek_job = await loop.run_in_executor(
+        None, lambda: get_or_create_seekable(video["path"], video_id, quality)
+    )
+    ok = await loop.run_in_executor(None, lambda: seek_job.start_seek(position))
+    return {"ok": ok}
+
+
+@app.get("/api/video/{video_id}/stream/{quality}/segments-ready")
+async def api_segments_ready(video_id: str, quality: str, seek: float = 0):
+    """检查 seek 转码的分片是否就绪"""
+    seek_job = get_seekable_job(video_id, quality)
+    if not seek_job:
+        return {"ready": False, "segments": 0}
+    if seek > 0:
+        return {"ready": seek_job.seek_ready, "segments": seek_job.get_seek_segment_count()}
+    return {"ready": False, "segments": 0}
+
+
 @app.get("/api/video/{video_id}/stream/{quality}/{segment}")
 async def api_segment(video_id: str, quality: str, segment: str):
+    from config import HLS_SEGMENT_TIME
     seg_path = Path(config.get("cache_dir")) / video_id / quality / segment
     if not seg_path.exists():
-        raise HTTPException(status_code=404, detail="Segment not found")
+        # 尝试查找对应的 seek 分片（绝对编号 → seek 文件）
+        m = re.match(r"seg_(\d+)\.ts", segment)
+        if m:
+            abs_idx = int(m.group(1))
+            seek_job = get_seekable_job(video_id, quality)
+            if seek_job and seek_job.seek_position > 0:
+                seek_start = int(seek_job.seek_position) // HLS_SEGMENT_TIME
+                seek_idx = abs_idx - seek_start
+                if seek_idx >= 0:
+                    seek_prefix = f"seek_{int(seek_job.seek_position)}"
+                    seek_path = seg_path.parent / f"{seek_prefix}_{seek_idx:05d}.ts"
+                    if seek_path.exists():
+                        return FileResponse(seek_path, media_type="video/mp2t")
+        # 返回 200 空响应，hls.js 视为 gap 而非 error，避免触发 recoverMediaError
+        return Response(content=b"", status_code=200, media_type="video/mp2t")
     return FileResponse(seg_path, media_type="video/mp2t")
 
 
@@ -222,10 +295,51 @@ async def api_cache_batch():
     return get_batch_state()
 
 
+@app.post("/api/cache/pause")
+async def api_cache_pause(request: Request):
+    body = await request.json()
+    video_id = body.get("video_id", "")
+    from cache_manager import pause_batch_video
+    ok = pause_batch_video(video_id)
+    return {"ok": ok}
+
+
+@app.post("/api/cache/resume")
+async def api_cache_resume(request: Request):
+    body = await request.json()
+    video_id = body.get("video_id", "")
+    from cache_manager import resume_batch_video
+    ok = resume_batch_video(video_id)
+    return {"ok": ok}
+
+
+@app.get("/api/cache/active-progress")
+async def api_active_progress():
+    """返回所有活跃转码任务的进度（包括非批量缓存的）"""
+    from transcoder import get_all_active_jobs
+    from cache_manager import get_batch_state
+    jobs = get_all_active_jobs()
+    batch = get_batch_state()
+    # Merge: batch state has more accurate progress for batch videos
+    merged = {}
+    for vid, prog in jobs.items():
+        merged[vid] = prog
+    for vid, prog in batch.get("video_progress", {}).items():
+        if prog["status"] in ("caching", "paused", "done", "error"):
+            merged[vid] = prog
+    return {"video_progress": merged}
+
+
 @app.get("/api/video/{video_id}/cache-status")
 async def api_video_cache_status(video_id: str):
     from cache_manager import get_cached_qualities
     return {"video_id": video_id, "cached_qualities": get_cached_qualities(video_id)}
+
+
+@app.post("/api/video/{video_id}/cache/clear")
+async def api_clear_video_cache(video_id: str):
+    from cache_manager import clear_video_cache
+    return clear_video_cache(video_id)
 
 
 @app.post("/api/cache/evict-and-start")

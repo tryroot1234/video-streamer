@@ -116,11 +116,19 @@
             <div class="player-wrapper">
                 <video id="video-player" controls></video>
             </div>
+            <div id="player-time-bar">
+                <span id="player-current-time">0:00</span>
+                <span id="player-separator">/</span>
+                <span id="player-total-time">0:00</span>
+            </div>
             <div id="video-info"></div>
-            <div id="quality-selector">
-                <label>画质:</label>
-                <select id="quality-select" onchange="switchQuality(this.value)">
-                </select>
+            <div class="player-controls">
+                <div id="quality-selector">
+                    <label>画质:</label>
+                    <select id="quality-select" onchange="switchQuality(this.value)">
+                    </select>
+                </div>
+                <button id="clear-cache-btn" class="cache-btn cache-btn-stop" onclick="clearCurrentVideoCache()">清除缓存</button>
             </div>
         </section>
     </main>
@@ -150,6 +158,14 @@
                 </div>
             </div>
             <div id="cache-modal-msg2" class="hidden"></div>
+        </div>
+    </div>
+
+    <!-- 加载中遮罩 -->
+    <div id="loading-overlay" class="modal-overlay hidden">
+        <div class="loading-spinner">
+            <div class="spinner"></div>
+            <p id="loading-overlay-msg">正在加载...</p>
         </div>
     </div>
 

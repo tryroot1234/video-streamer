@@ -288,6 +288,38 @@ main {
     background: #e57373;
 }
 
+.video-card .cache-progress-bar.paused {
+    background: #f0a500;
+}
+
+.video-card .cache-pause-btn {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    background: rgba(0,0,0,0.7);
+    border: none;
+    border-radius: 50%;
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.2s;
+    z-index: 2;
+}
+
+.video-card .cache-pause-btn:hover {
+    background: rgba(0,0,0,0.9);
+}
+
+.video-card .cache-pause-btn svg {
+    width: 14px;
+    height: 14px;
+}
+
 .video-card .cache-pct {
     position: absolute;
     bottom: 8px;
@@ -353,6 +385,41 @@ main {
 #quality-selector label {
     font-size: 14px;
     color: #aaa;
+}
+
+/* Player time bar */
+#player-time-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 0 4px;
+    font-size: 14px;
+    color: #aaa;
+    font-variant-numeric: tabular-nums;
+}
+
+#player-current-time {
+    color: #eee;
+    font-weight: 500;
+}
+
+#player-total-time {
+    color: #888;
+}
+
+/* Player controls row */
+.player-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+#clear-cache-btn {
+    font-size: 13px;
+    padding: 6px 14px;
+    border: 1px solid #5a2a2a;
 }
 
 #quality-select {
@@ -707,6 +774,36 @@ main {
     border-radius: 6px;
     font-size: 13px;
     margin-top: 12px;
+}
+
+/* Loading overlay */
+.loading-spinner {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    color: #eee;
+    z-index: 101;
+}
+
+.spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid rgba(255,255,255,0.2);
+    border-top-color: #4a6fa5;
+    border-radius: 50%;
+    margin: 0 auto 16px;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.loading-spinner p {
+    font-size: 14px;
+    color: #aaa;
 }
 
 /* Responsive */

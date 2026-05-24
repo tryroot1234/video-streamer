@@ -23,17 +23,17 @@
 player/
 ├── main.py              # FastAPI 应用入口，API 路由
 ├── config.py            # 配置管理（动态设置 + 持久化）
-├── transcoder.py        # FFmpeg 转码核心逻辑
+├── transcoder.py        # FFmpeg 转码核心逻辑 + m3u8 动态生成
 ├── video_scanner.py     # 视频文件扫描与元数据提取
-├── cache_manager.py     # 转码缓存管理与清理
+├── cache_manager.py     # 转码缓存管理、批量缓存、清理
+├── test_player.py       # 测试用例（100 个）
 ├── requirements.txt     # Python 依赖
 ├── settings.json        # 运行时配置（自动生成）
 ├── static/
 │   ├── home.html        # 首页（访问链接 + 快捷入口）
 │   ├── library.html     # 视频库页面（排序 + 分页 + 播放器）
-│   ├── library.js       # 视频库前端逻辑
-│   ├── style.css        # 样式
-│   └── player.js        # 旧版播放器逻辑（已迁移至 library.js）
+│   ├── library.js       # 视频库前端逻辑 + HLS 播放器
+│   └── style.css        # 样式
 └── cache/               # 默认转码缓存目录（可在页面修改）
 ```
 
@@ -143,12 +143,39 @@ http://<your-tailscale-ip>:8000
 |------|------|------|
 | `GET` | `/api/videos` | 获取视频列表 |
 | `GET` | `/api/video/{id}/info` | 获取视频详情 |
-| `GET` | `/api/video/{id}/stream/{quality}` | 获取 HLS 播放列表 |
-| `GET` | `/api/video/{id}/stream/{quality}/{segment}` | 获取 TS 分片 |
+| `GET` | `/api/video/{id}/stream/{quality}` | 获取 HLS 播放列表（动态生成完整 m3u8） |
+| `GET` | `/api/video/{id}/stream/{quality}/{segment}` | 获取 TS 分片（缺失返回 200 空响应） |
+| `POST` | `/api/video/{id}/seek/{quality}` | 从指定位置启动断点转码 |
+| `GET` | `/api/video/{id}/stream/{quality}/segments-ready` | 检查 seek 转码分片是否就绪 |
 | `GET` | `/api/video/{id}/thumbnail` | 获取视频缩略图 |
+| `GET` | `/api/video/{id}/cache-status` | 获取视频已缓存画质 |
+| `POST` | `/api/video/{id}/cache/clear` | 清除视频缓存 |
 | `GET` | `/api/settings` | 获取当前配置 |
 | `PUT` | `/api/settings` | 更新配置 |
 | `GET` | `/api/cache/status` | 查看缓存状态 |
+| `GET` | `/api/disk/status` | 查看磁盘状态 |
+| `POST` | `/api/cache/init` | 启动批量缓存 |
+| `POST` | `/api/cache/stop` | 停止批量缓存 |
+| `GET` | `/api/cache/batch` | 查看批量缓存进度 |
+| `GET` | `/api/cache/active-progress` | 查看所有活跃转码进度 |
+
+## 测试
+
+```bash
+# 运行全部测试（100 个用例）
+venv/bin/python -m pytest test_player.py -v
+
+# 运行指定测试组
+venv/bin/python -m pytest test_player.py -v -k "TestSegmentEndpoint"
+```
+
+测试覆盖：
+- m3u8 动态生成（时长、分片、边界条件）
+- segment 端点行为（已有分片、缺失分片、seek 映射）
+- stream 端点统一流程
+- seek 断点转码流程
+- 缓存清除与重建
+- Safari 播放稳定性（FRAG_BUFFERED 延迟 seek、防抖、200 空响应）
 
 ## 支持的视频格式
 

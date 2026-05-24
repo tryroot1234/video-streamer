@@ -8,6 +8,7 @@ let perPage = 12;
 let currentSort = "time-desc";
 
 let batchPollTimer = null;
+let activePollTimer = null;
 let pendingPlayVideo = null;
 
 // ---------- Settings ----------
@@ -179,6 +180,10 @@ function renderLibrary(videos) {
                 <span class="badge">${resLabel}</span>
                 <div class="cache-progress"><div class="cache-progress-bar" id="pgb-${v.id}"></div></div>
                 <span class="cache-pct" id="pgp-${v.id}"></span>
+                <button class="cache-pause-btn hidden" id="pgk-${v.id}" onclick="event.stopPropagation(); togglePauseCache('${v.id}')">
+                    <svg class="pause-icon" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>
+                    <svg class="resume-icon hidden" viewBox="0 0 24 24"><polygon points="6,4 20,12 6,20" fill="currentColor"/></svg>
+                </button>
             </div>
             <div class="info">
                 <h3 title="${v.name}">${v.name}</h3>
@@ -279,30 +284,6 @@ function pollBatchProgress() {
                 statusEl.textContent = `${s.done} / ${s.total} (${pct}%)`;
             }
 
-            // 更新每个视频卡片的进度
-            if (s.video_progress) {
-                for (const [vid, prog] of Object.entries(s.video_progress)) {
-                    const bar = document.getElementById(`pgb-${vid}`);
-                    const pctEl = document.getElementById(`pgp-${vid}`);
-                    if (bar && pctEl) {
-                        bar.style.width = prog.percent + "%";
-                        if (prog.status === "caching") {
-                            pctEl.textContent = prog.percent + "%";
-                            pctEl.style.display = "block";
-                            bar.className = "cache-progress-bar";
-                        } else if (prog.status === "done") {
-                            pctEl.textContent = "已缓存";
-                            pctEl.style.display = "block";
-                            bar.className = "cache-progress-bar done";
-                        } else if (prog.status === "error") {
-                            pctEl.textContent = "失败";
-                            pctEl.style.display = "block";
-                            bar.className = "cache-progress-bar error";
-                        }
-                    }
-                }
-            }
-
             if (s.running) {
                 currentEl.textContent = s.current ? `正在缓存: ${s.current}` : "";
             } else {
@@ -321,6 +302,93 @@ function pollBatchProgress() {
             console.error("Poll batch progress error", e);
         }
     }, 1000);
+}
+
+// ---------- Active Progress (per-card) ----------
+
+function pollActiveProgress() {
+    if (activePollTimer) return;
+    activePollTimer = setInterval(async () => {
+        try {
+            const res = await fetch("/api/cache/active-progress");
+            const data = await res.json();
+            const progress = data.video_progress || {};
+            const activeIds = new Set();
+
+            for (const [vid, prog] of Object.entries(progress)) {
+                activeIds.add(vid);
+                const bar = document.getElementById(`pgb-${vid}`);
+                const pctEl = document.getElementById(`pgp-${vid}`);
+                const btn = document.getElementById(`pgk-${vid}`);
+                if (!bar || !pctEl) continue;
+
+                bar.style.width = prog.percent + "%";
+
+                if (prog.status === "caching") {
+                    pctEl.textContent = prog.percent + "%";
+                    pctEl.style.display = "block";
+                    bar.className = "cache-progress-bar";
+                    if (btn) { btn.classList.remove("hidden"); showPauseIcon(btn); }
+                } else if (prog.status === "paused") {
+                    pctEl.textContent = "已暂停 " + prog.percent + "%";
+                    pctEl.style.display = "block";
+                    bar.className = "cache-progress-bar paused";
+                    if (btn) { btn.classList.remove("hidden"); showResumeIcon(btn); }
+                } else if (prog.status === "done") {
+                    pctEl.textContent = "已缓存";
+                    pctEl.style.display = "block";
+                    bar.className = "cache-progress-bar done";
+                    if (btn) btn.classList.add("hidden");
+                } else if (prog.status === "error") {
+                    pctEl.textContent = "失败";
+                    pctEl.style.display = "block";
+                    bar.className = "cache-progress-bar error";
+                    if (btn) btn.classList.add("hidden");
+                }
+            }
+
+            // Hide pause button for videos no longer active
+            document.querySelectorAll(".cache-pause-btn:not(.hidden)").forEach(btn => {
+                const vid = btn.id.replace("pgk-", "");
+                if (!activeIds.has(vid)) btn.classList.add("hidden");
+            });
+        } catch (e) {
+            // ignore
+        }
+    }, 1000);
+}
+
+function showPauseIcon(btn) {
+    btn.querySelector(".pause-icon").classList.remove("hidden");
+    btn.querySelector(".resume-icon").classList.add("hidden");
+}
+
+function showResumeIcon(btn) {
+    btn.querySelector(".pause-icon").classList.add("hidden");
+    btn.querySelector(".resume-icon").classList.remove("hidden");
+}
+
+async function togglePauseCache(videoId) {
+    const btn = document.getElementById(`pgk-${videoId}`);
+    if (!btn) return;
+    const isPaused = btn.querySelector(".resume-icon").classList.contains("hidden") === false;
+    try {
+        if (isPaused) {
+            await fetch("/api/cache/resume", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({video_id: videoId}),
+            });
+        } else {
+            await fetch("/api/cache/pause", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({video_id: videoId}),
+            });
+        }
+    } catch (e) {
+        console.error("Toggle pause error", e);
+    }
 }
 
 // ---------- Disk Status ----------
@@ -441,18 +509,49 @@ async function playVideo(video) {
     try {
         const res = await fetch(`/api/video/${encodeURIComponent(video.id)}/cache-status`);
         const data = await res.json();
-        if (!data.cached_qualities.includes(quality)) {
-            showCacheModal(video);
+        if (data.cached_qualities.includes(quality)) {
+            doPlay(video);
             return;
         }
     } catch (e) {
-        // 如果检查失败，直接播放
+        doPlay(video);
+        return;
     }
-    doPlay(video);
+
+    // 未缓存，检查磁盘空间
+    try {
+        const diskRes = await fetch("/api/disk/status");
+        const disk = await diskRes.json();
+        if (disk.can_cache_more) {
+            // 空间充足，显示加载状态，等待转码出足够分片后再播放
+            showLoadingOverlay(video, quality);
+        } else {
+            showCacheModal(video);
+        }
+    } catch (e) {
+        doPlay(video);
+    }
+}
+
+function showLoadingOverlay(video, quality) {
+    document.getElementById("loading-overlay-msg").textContent = `正在加载 ${video.name}...`;
+    document.getElementById("loading-overlay").classList.remove("hidden");
+
+    // 先触发转码
+    fetch(`/api/video/${encodeURIComponent(video.id)}/stream/${quality}`).then(() => {
+        // 转码已有足够分片，直接播放
+        document.getElementById("loading-overlay").classList.add("hidden");
+        doPlay(video);
+    }).catch(() => {
+        document.getElementById("loading-overlay").classList.add("hidden");
+        doPlay(video);
+    });
 }
 
 function doPlay(video) {
     currentVideo = video;
+    _maxBufferedEnd = 0;
+    _seekingInProgress = false;
     document.getElementById("library").classList.add("hidden");
     document.getElementById("player-section").classList.remove("hidden");
     document.getElementById("toolbar").classList.add("hidden");
@@ -481,7 +580,17 @@ function doPlay(video) {
     `;
 
     switchQuality(video.recommended_quality);
+    setupTimeDisplay();
 }
+
+let _seekingInProgress = false;
+let _maxBufferedEnd = 0;
+let _initialSeekDone = false;
+let _pendingSeekTime = null;
+let _pendingSeekTimer = null;
+let _destroyed = false;
+let _lastSeekTime = 0;
+const SEEK_DEBOUNCE_MS = 800;
 
 function switchQuality(quality) {
     if (!currentVideo) return;
@@ -496,43 +605,228 @@ function switchQuality(quality) {
     }
 
     video.muted = true;
+    _initialSeekDone = false;
+    _seekingInProgress = false;
+    _maxBufferedEnd = 0;
+    _lastSeekTime = 0;
+    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
+    _pendingSeekTime = null;
+    _destroyed = false;
 
     if (Hls.isSupported()) {
         hls = new Hls({
             maxBufferLength: 30,
             maxMaxBufferLength: 120,
             startFragPrefetch: true,
-            liveDurationInfinity: true,
             enableWorker: true,
+            fragLoadingMaxRetry: 6,
+            fragLoadingRetryDelay: 1000,
         });
         hls.loadSource(url);
         hls.attachMedia(video);
-        let seekedToStart = false;
+        let inited = false;
         hls.on(Hls.Events.FRAG_BUFFERED, () => {
-            if (!seekedToStart) {
-                seekedToStart = true;
+            if (_pendingSeekTime !== null) {
+                // 检查缓冲是否已覆盖 seek 目标位置
+                const buf = video.buffered;
+                let covered = false;
+                for (let i = 0; i < buf.length; i++) {
+                    if (_pendingSeekTime >= buf.start(i) && _pendingSeekTime <= buf.end(i)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) {
+                    // 缓冲已覆盖，执行跳转并恢复 seeking 监听
+                    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
+                    video.currentTime = _pendingSeekTime;
+                    _pendingSeekTime = null;
+                    _initialSeekDone = true;
+                    video.onseeking = () => handleVideoSeek(video, quality);
+                    video.play().catch(() => {});
+                }
+                // 未覆盖时等待下一个 FRAG_BUFFERED 事件
+                return;
+            }
+            if (!inited) {
+                inited = true;
+                _initialSeekDone = true;
                 video.currentTime = 0;
                 video.play().catch(() => {});
+            }
+            const buf = video.buffered;
+            _maxBufferedEnd = 0;
+            for (let i = 0; i < buf.length; i++) {
+                if (buf.end(i) > _maxBufferedEnd) _maxBufferedEnd = buf.end(i);
             }
         });
         hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) {
                 console.error("HLS fatal error:", data);
-                document.getElementById("status").textContent = "流媒体错误";
+                document.getElementById("status").textContent = "流媒体错误，请刷新页面";
             }
         });
-    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = url;
-        video.addEventListener("loadedmetadata", () => {
-            video.currentTime = 0;
-            video.play().catch(() => {});
-        });
+
+        video.onseeking = () => handleVideoSeek(video, quality);
     } else {
         document.getElementById("status").textContent = "当前浏览器不支持 HLS";
     }
 }
 
+async function handleVideoSeek(video, quality) {
+    if (_seekingInProgress) return;
+    if (!_initialSeekDone) return;
+
+    // 防抖：过滤 hls.js gap-controller 等内部 seek 事件
+    const now = Date.now();
+    if (now - _lastSeekTime < SEEK_DEBOUNCE_MS) return;
+    _lastSeekTime = now;
+
+    const seekTime = video.currentTime;
+    const buf = video.buffered;
+
+    // 重新计算当前缓冲末端（Safari 会主动回收已缓冲区间）
+    _maxBufferedEnd = 0;
+    for (let i = 0; i < buf.length; i++) {
+        if (buf.end(i) > _maxBufferedEnd) _maxBufferedEnd = buf.end(i);
+    }
+
+    // 在已缓冲范围内，不需要断点缓存
+    for (let i = 0; i < buf.length; i++) {
+        if (seekTime >= buf.start(i) && seekTime <= buf.end(i)) return;
+    }
+    if (seekTime < _maxBufferedEnd) return;
+
+    // 拖拽到未缓冲位置，触发断点缓存
+    _seekingInProgress = true;
+    const videoId = currentVideo.id;
+    const statusEl = document.getElementById("status");
+
+    try {
+        statusEl.textContent = "正在从新位置加载...";
+
+        // 启动 seek 转码（会自动停止之前的 seek 转码）
+        const res = await fetch(`/api/video/${encodeURIComponent(videoId)}/seek/${quality}`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({position: seekTime}),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+            statusEl.textContent = "跳转失败";
+            _seekingInProgress = false;
+            return;
+        }
+
+        // 等待目标位置分片就绪
+        let ready = false;
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            if (_destroyed || currentVideo?.id !== videoId) break;
+            try {
+                const checkRes = await fetch(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}/segments-ready?seek=${seekTime}`);
+                const checkData = await checkRes.json();
+                if (checkData.ready) { ready = true; break; }
+            } catch (_) {}
+        }
+
+        if (ready && !_destroyed && currentVideo?.id === videoId) {
+            // 分片就绪，刷新 m3u8 并在 FRAG_BUFFERED 回调中跳转
+            // 移除 seeking 监听，在 FRAG_BUFFERED 回调中恢复
+            video.onseeking = null;
+            _pendingSeekTime = seekTime;
+            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}`);
+            // 超时兜底：若 5 秒内缓冲未覆盖目标位置，强制跳转
+            if (_pendingSeekTimer) clearTimeout(_pendingSeekTimer);
+            _pendingSeekTimer = setTimeout(() => {
+                if (_pendingSeekTime !== null && !_destroyed) {
+                    video.currentTime = _pendingSeekTime;
+                    _pendingSeekTime = null;
+                    _initialSeekDone = true;
+                    video.onseeking = () => handleVideoSeek(video, quality);
+                    video.play().catch(() => {});
+                }
+                _pendingSeekTimer = null;
+            }, 5000);
+            statusEl.textContent = "";
+        } else if (!ready) {
+            statusEl.textContent = "加载超时，请重试";
+        }
+    } catch (e) {
+        console.error("Seek error:", e);
+        statusEl.textContent = "跳转出错";
+    } finally {
+        _seekingInProgress = false;
+    }
+}
+
+// ---------- Time Display ----------
+
+let _timeUpdateHandler = null;
+
+function setupTimeDisplay() {
+    const video = document.getElementById("video-player");
+    const curEl = document.getElementById("player-current-time");
+    const totalEl = document.getElementById("player-total-time");
+
+    // 清除旧的事件监听
+    if (_timeUpdateHandler) {
+        video.removeEventListener("timeupdate", _timeUpdateHandler);
+    }
+
+    _timeUpdateHandler = () => {
+        curEl.textContent = formatDuration(video.currentTime);
+        // duration 可能是 Infinity (直播流) 或 NaN
+        if (video.duration && isFinite(video.duration) && video.duration > 0) {
+            totalEl.textContent = formatDuration(video.duration);
+        } else if (currentVideo) {
+            totalEl.textContent = formatDuration(currentVideo.duration);
+        }
+    };
+    video.addEventListener("timeupdate", _timeUpdateHandler);
+
+    // 初始化显示
+    curEl.textContent = "0:00";
+    totalEl.textContent = currentVideo ? formatDuration(currentVideo.duration) : "0:00";
+}
+
+// ---------- Clear Video Cache ----------
+
+async function clearCurrentVideoCache() {
+    if (!currentVideo) return;
+    if (!confirm(`确定清除「${currentVideo.name}」的缓存分片？`)) return;
+
+    const btn = document.getElementById("clear-cache-btn");
+    btn.disabled = true;
+    btn.textContent = "清除中...";
+
+    try {
+        const res = await fetch(`/api/video/${encodeURIComponent(currentVideo.id)}/cache/clear`, {
+            method: "POST",
+        });
+        const data = await res.json();
+        if (data.ok) {
+            goBack();
+            return;
+        } else {
+            btn.textContent = "清除失败";
+            setTimeout(() => {
+                btn.textContent = "清除缓存";
+                btn.disabled = false;
+            }, 2000);
+        }
+    } catch (e) {
+        console.error("Clear cache error:", e);
+        btn.textContent = "清除失败";
+        setTimeout(() => {
+            btn.textContent = "清除缓存";
+            btn.disabled = false;
+        }, 2000);
+    }
+}
+
 function goBack() {
+    _destroyed = true;
     if (hls) {
         hls.destroy();
         hls = null;
@@ -540,11 +834,24 @@ function goBack() {
     const video = document.getElementById("video-player");
     video.pause();
     video.removeAttribute("src");
+    if (_timeUpdateHandler) {
+        video.removeEventListener("timeupdate", _timeUpdateHandler);
+        _timeUpdateHandler = null;
+    }
+
+    _seekingInProgress = false;
+    _maxBufferedEnd = 0;
+    _initialSeekDone = false;
+    _lastSeekTime = 0;
+    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
+    _pendingSeekTime = null;
+    _destroyed = false;
 
     document.getElementById("player-section").classList.add("hidden");
     document.getElementById("library").classList.remove("hidden");
     document.getElementById("toolbar").classList.remove("hidden");
     document.getElementById("pagination").classList.remove("hidden");
+    document.getElementById("status").textContent = "";
     currentVideo = null;
 
     checkDiskStatus();
@@ -554,3 +861,4 @@ function goBack() {
 
 loadVideos();
 checkDiskStatus();
+pollActiveProgress();
