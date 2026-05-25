@@ -587,7 +587,6 @@ let _seekingInProgress = false;
 let _maxBufferedEnd = 0;
 let _initialSeekDone = false;
 let _pendingSeekTime = null;
-let _pendingSeekTimer = null;
 let _destroyed = false;
 let _lastSeekTime = 0;
 const SEEK_DEBOUNCE_MS = 800;
@@ -609,7 +608,6 @@ function switchQuality(quality) {
     _seekingInProgress = false;
     _maxBufferedEnd = 0;
     _lastSeekTime = 0;
-    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
     _pendingSeekTime = null;
     _destroyed = false;
 
@@ -638,7 +636,6 @@ function switchQuality(quality) {
                 }
                 if (covered) {
                     // 缓冲已覆盖，执行跳转并恢复 seeking 监听
-                    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
                     video.currentTime = _pendingSeekTime;
                     _pendingSeekTime = null;
                     _initialSeekDone = true;
@@ -731,23 +728,37 @@ async function handleVideoSeek(video, quality) {
         }
 
         if (ready && !_destroyed && currentVideo?.id === videoId) {
-            // 分片就绪，加载从 seek 位置开始的 m3u8
-            // start 参数让后端生成截断 m3u8，hls.js 直接从目标位置缓冲
+            // 销毁旧实例，创建新实例，先设置 currentTime 再加载源
+            // 避免 loadSource() 重置播放位置到 0
             video.onseeking = null;
-            _pendingSeekTime = seekTime;
-            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}?start=${seekTime}`);
-            // 超时兜底：若 5 秒内缓冲未覆盖目标位置，强制跳转
-            if (_pendingSeekTimer) clearTimeout(_pendingSeekTimer);
-            _pendingSeekTimer = setTimeout(() => {
-                if (_pendingSeekTime !== null && !_destroyed) {
-                    video.currentTime = _pendingSeekTime;
+            if (hls) { hls.destroy(); hls = null; }
+            video.currentTime = seekTime;
+            hls = new Hls({
+                maxBufferLength: 30,
+                maxMaxBufferLength: 120,
+                startFragPrefetch: true,
+                enableWorker: true,
+                fragLoadingMaxRetry: 6,
+                fragLoadingRetryDelay: 1000,
+            });
+            let seekInited = false;
+            hls.on(Hls.Events.FRAG_BUFFERED, () => {
+                if (!seekInited) {
+                    seekInited = true;
                     _pendingSeekTime = null;
                     _initialSeekDone = true;
                     video.onseeking = () => handleVideoSeek(video, quality);
                     video.play().catch(() => {});
                 }
-                _pendingSeekTimer = null;
-            }, 5000);
+            });
+            hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data.fatal) {
+                    console.error("HLS fatal error:", data);
+                    document.getElementById("status").textContent = "流媒体错误，请刷新页面";
+                }
+            });
+            hls.attachMedia(video);
+            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}?start=${seekTime}`);
             statusEl.textContent = "";
         } else if (!ready) {
             statusEl.textContent = "加载超时，请重试";
@@ -843,7 +854,6 @@ function goBack() {
     _maxBufferedEnd = 0;
     _initialSeekDone = false;
     _lastSeekTime = 0;
-    if (_pendingSeekTimer) { clearTimeout(_pendingSeekTimer); _pendingSeekTimer = null; }
     _pendingSeekTime = null;
     _destroyed = false;
 
