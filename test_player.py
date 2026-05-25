@@ -2011,4 +2011,148 @@ class TestNoRecoverMediaError:
                 m3u8 = generate_full_m3u8("vid1", "720p", duration=duration)
             assert "#EXT-X-PLAYLIST-TYPE:VOD" in m3u8, f"VOD type missing for duration={duration}"
 
+
+# ============================================================
+# TC-25: m3u8 start 参数（seek 截断播放列表）
+# ============================================================
+
+
+class TestM3u8StartParameter:
+    """m3u8 start 参数测试（seek 后从指定位置加载）"""
+
+    def test_start_zero_same_as_full(self, cache_dir):
+        """TC-25a: start=0 等同于完整 m3u8"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            full = generate_full_m3u8("vid1", "720p", duration=60.0)
+            from_start = generate_full_m3u8("vid1", "720p", duration=60.0, start=0)
+
+        assert full == from_start
+
+    def test_start_truncates_segments(self, cache_dir):
+        """TC-25b: start=30 截断前 5 个 segment（30//6=5）"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
+        # 原来 10 个 segment，截断后 5 个（seg_00005 ~ seg_00009）
+        assert m3u8.count("#EXTINF:") == 5
+        assert "seg_00005.ts" in m3u8
+        assert "seg_00009.ts" in m3u8
+        # 被截断的 segment 不在
+        assert "seg_00000.ts" not in m3u8
+        assert "seg_00004.ts" not in m3u8
+
+    def test_start_media_sequence(self, cache_dir):
+        """TC-25c: start=30 → MEDIA-SEQUENCE=5"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
+        assert "#EXT-X-MEDIA-SEQUENCE:5" in m3u8
+
+    def test_start_preserves_endlist(self, cache_dir):
+        """TC-25d: 截断 m3u8 仍包含 ENDLIST"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
+        assert "#EXT-X-ENDLIST" in m3u8
+
+    def test_start_preserves_vod_type(self, cache_dir):
+        """TC-25e: 截断 m3u8 仍包含 PLAYLIST-TYPE:VOD"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
         assert "#EXT-X-PLAYLIST-TYPE:VOD" in m3u8
+
+    def test_start_duration_sum(self, cache_dir):
+        """TC-25f: 截断后 segment 总时长 = duration - start"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
+        extinf_lines = [l for l in m3u8.split("\n") if l.startswith("#EXTINF:")]
+        total = sum(float(l.split(":")[1].rstrip(",")) for l in extinf_lines)
+        assert abs(total - 30.0) < 0.1
+
+    def test_start_at_non_segment_boundary(self, cache_dir):
+        """TC-25g: start=25（非 segment 边界）→ 从 seg_00004 开始（25//6=4）"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=25)
+
+        assert "#EXT-X-MEDIA-SEQUENCE:4" in m3u8
+        assert "seg_00004.ts" in m3u8
+        assert "seg_00003.ts" not in m3u8
+
+    def test_start_at_last_segment(self, cache_dir):
+        """TC-25h: start=54 → 只剩最后 1 个 segment（seg_00009）"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=54)
+
+        assert m3u8.count("#EXTINF:") == 1
+        assert "seg_00009.ts" in m3u8
+
+    def test_start_beyond_duration(self, cache_dir):
+        """TC-25i: start >= duration → 至少保留最后 1 个 segment"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=100)
+
+        assert m3u8.count("#EXTINF:") >= 1
+        assert "#EXT-X-ENDLIST" in m3u8
+
+    def test_start_with_seek_segments(self, cache_dir):
+        """TC-25j: start 参数与 seek 分片共存"""
+        from transcoder import generate_full_m3u8
+
+        seg_dir = cache_dir / "vid1" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        # 初始转码
+        for i in range(5):
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
+        # seek 到 30 秒的分片
+        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30)
+
+        # 从 seg_00005 开始，seek_30_00000 → seg_00005 被收录
+        assert "seg_00005.ts" in m3u8
+        assert m3u8.count("#EXTINF:") == 5
+
+    def test_stream_endpoint_with_start(self, cache_dir):
+        """TC-25k: stream 端点支持 start 查询参数"""
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch as mp
+
+        with mp("config._settings", {
+            "video_dir": "/tmp",
+            "cache_dir": str(cache_dir),
+            "max_cache_size_gb": 50,
+        }):
+            import main as main_module
+            main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
+            from main import app
+            client = TestClient(app)
+
+            with mp("main.get_or_start_transcode"):
+                with mp("main.is_cached", return_value=True):
+                    resp = client.get("/api/video/vid1/stream/720p?start=30")
+
+            assert resp.status_code == 200
+            assert "#EXT-X-MEDIA-SEQUENCE:5" in resp.text
+            assert "seg_00005.ts" in resp.text
+            assert "seg_00000.ts" not in resp.text

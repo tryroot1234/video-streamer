@@ -731,11 +731,11 @@ async function handleVideoSeek(video, quality) {
         }
 
         if (ready && !_destroyed && currentVideo?.id === videoId) {
-            // 分片就绪，刷新 m3u8 并在 FRAG_BUFFERED 回调中跳转
-            // 移除 seeking 监听，在 FRAG_BUFFERED 回调中恢复
+            // 分片就绪，加载从 seek 位置开始的 m3u8
+            // start 参数让后端生成截断 m3u8，hls.js 直接从目标位置缓冲
             video.onseeking = null;
             _pendingSeekTime = seekTime;
-            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}`);
+            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}?start=${seekTime}`);
             // 超时兜底：若 5 秒内缓冲未覆盖目标位置，强制跳转
             if (_pendingSeekTimer) clearTimeout(_pendingSeekTimer);
             _pendingSeekTimer = setTimeout(() => {

@@ -137,7 +137,7 @@ def rewrite_m3u8(content: str, video_id: str, quality: str) -> str:
 
 
 @app.get("/api/video/{video_id}/stream/{quality}")
-async def api_stream(video_id: str, quality: str, request: Request):
+async def api_stream(video_id: str, quality: str, request: Request, start: float = 0):
     refresh_videos()
     video = _video_cache.get(video_id)
     if not video:
@@ -149,8 +149,8 @@ async def api_stream(video_id: str, quality: str, request: Request):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, job.wait_ready, 30.0)
 
-    # 动态生成完整 m3u8
-    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0))
+    # 动态生成 m3u8（支持 start 参数从指定位置截断）
+    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0), start=start)
     return Response(
         content=m3u8,
         media_type="application/vnd.apple.mpegurl",

@@ -344,15 +344,21 @@ def _rewrite_seek_m3u8(content: str, video_id: str, quality: str, seek_position:
     return content
 
 
-def generate_full_m3u8(video_id: str, quality: str, duration: float) -> str:
+def generate_full_m3u8(video_id: str, quality: str, duration: float, start: float = 0) -> str:
     """动态生成覆盖完整视频时间线的 m3u8 播放列表。
 
     扫描缓存目录中已有的 segment 文件，为未转码的位置生成占位条目。
-    hls.js 请求不存在的 segment 时会收到 404 并自动重试。
+    hls.js 请求不存在的 segment 时会收到 200 空响应（视为 gap）。
+
+    start > 0 时，生成从指定秒数开始的截断 m3u8，用于 seek 后直接加载。
     """
     cache_dir = Path(config.get("cache_dir")) / video_id / quality
     prefix = f"/api/video/{video_id}/stream/{quality}/"
     total_segments = max(1, math.ceil(duration / HLS_SEGMENT_TIME))
+
+    # 起始 segment 编号（不超过总 segment 数）
+    start_seg = max(0, int(start) // HLS_SEGMENT_TIME) if start > 0 else 0
+    start_seg = min(start_seg, total_segments - 1)
 
     # 收集已存在的 segment 绝对编号
     available = set()
@@ -381,10 +387,10 @@ def generate_full_m3u8(video_id: str, quality: str, duration: float) -> str:
         "#EXT-X-VERSION:3",
         "#EXT-X-PLAYLIST-TYPE:VOD",
         f"#EXT-X-TARGETDURATION:{HLS_SEGMENT_TIME}",
-        "#EXT-X-MEDIA-SEQUENCE:0",
+        f"#EXT-X-MEDIA-SEQUENCE:{start_seg}",
     ]
 
-    for i in range(total_segments):
+    for i in range(start_seg, total_segments):
         if i < total_segments - 1:
             seg_duration = HLS_SEGMENT_TIME
         else:
