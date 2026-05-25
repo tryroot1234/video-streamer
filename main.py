@@ -11,11 +11,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import config
 from video_scanner import scan_videos
-from transcoder import get_or_start_transcode, get_or_create_seekable, get_seekable_job, generate_full_m3u8
+from transcoder import get_or_start_transcode, generate_full_m3u8, get_job
 from cache_manager import is_cached
 
 
@@ -38,36 +39,36 @@ def cleanup_old_processes():
         pass
 
 
-def cleanup_orphaned_seek_files():
-    """清理缓存目录中孤立的 seek 分片文件"""
-    cache_dir = Path(config.get("cache_dir"))
-    if not cache_dir.exists():
-        return
-    cleaned = 0
-    for seek_ts in cache_dir.rglob("seek_*_*.ts"):
-        seek_ts.unlink(missing_ok=True)
-        cleaned += 1
-    for seek_m3u8 in cache_dir.rglob("seek_*.m3u8"):
-        seek_m3u8.unlink(missing_ok=True)
-        cleaned += 1
-    if cleaned:
-        print(f"Cleaned up {cleaned} orphaned seek files")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.load_settings()
     Path(config.get("cache_dir")).mkdir(parents=True, exist_ok=True)
     cleanup_old_processes()
-    cleanup_orphaned_seek_files()
-    asyncio.get_event_loop().run_in_executor(None, refresh_videos)
+    _load_html_cache()
+    # 刷新视频列表后自动启动预转码
+    def _init_with_pretranscode():
+        videos = refresh_videos()
+        if videos:
+            from cache_manager import start_auto_pretranscode
+            start_auto_pretranscode(videos)
+    asyncio.get_event_loop().run_in_executor(None, _init_with_pretranscode)
     yield
 
 app = FastAPI(title="Video Streamer", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 _video_cache: dict[str, dict] = {}
 _last_scan: float = 0
 _scan_interval = 60
+
+# ---------- HTML Cache ----------
+_html_cache: dict[str, str] = {}
+
+
+def _load_html_cache():
+    static_dir = Path(__file__).parent / "static"
+    for name in ("home.html", "library.html"):
+        _html_cache[name] = (static_dir / name).read_text(encoding="utf-8")
 
 
 def refresh_videos(force: bool = False):
@@ -82,7 +83,7 @@ def refresh_videos(force: bool = False):
 # ---------- Settings ----------
 
 class SettingsUpdate(BaseModel):
-    video_dir: str | None = None
+    video_dirs: list[str] | None = None
     cache_dir: str | None = None
     max_cache_size_gb: int | None = None
 
@@ -94,9 +95,9 @@ async def api_get_settings():
 
 @app.put("/api/settings")
 async def api_update_settings(body: SettingsUpdate):
-    old_video_dir = config.get("video_dir")
+    old_video_dirs = config.get("video_dirs") or []
     updated = config.update(body.model_dump(exclude_none=True))
-    if updated["video_dir"] != old_video_dir:
+    if updated.get("video_dirs") != old_video_dirs:
         refresh_videos(force=True)
     return updated
 
@@ -105,14 +106,12 @@ async def api_update_settings(body: SettingsUpdate):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = Path(__file__).parent / "static" / "home.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(_html_cache.get("home.html", ""))
 
 
 @app.get("/library", response_class=HTMLResponse)
 async def library():
-    html_path = Path(__file__).parent / "static" / "library.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(_html_cache.get("library.html", ""))
 
 
 @app.get("/api/videos")
@@ -145,12 +144,17 @@ async def api_stream(video_id: str, quality: str, request: Request, start: float
 
     # 如果没有足够分片，启动转码并等待
     if not is_cached(video_id, quality, video.get("duration")):
-        job = get_or_start_transcode(video["path"], video_id, quality)
+        job = get_or_start_transcode(video["path"], video_id, quality,
+                                     source_bitrate_kbps=video.get("bitrate", 0))
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, job.wait_ready, 30.0)
 
+    # 检查转码是否仍在进行中
+    job = get_job(video_id, quality)
+    is_live = job is not None and job.is_alive() and not job.finished
+
     # 动态生成 m3u8（支持 start 参数从指定位置截断）
-    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0), start=start)
+    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0), start=start, is_live=is_live)
     return Response(
         content=m3u8,
         media_type="application/vnd.apple.mpegurl",
@@ -170,46 +174,30 @@ async def api_seek(video_id: str, quality: str, request: Request):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    job = get_or_start_transcode(video["path"], video_id, quality,
+                                 source_bitrate_kbps=video.get("bitrate", 0))
     loop = asyncio.get_event_loop()
-    seek_job = await loop.run_in_executor(
-        None, lambda: get_or_create_seekable(video["path"], video_id, quality)
-    )
-    ok = await loop.run_in_executor(None, lambda: seek_job.start_seek(position))
+    ok = await loop.run_in_executor(None, lambda: job.start_seek(position))
     return {"ok": ok}
 
 
 @app.get("/api/video/{video_id}/stream/{quality}/segments-ready")
 async def api_segments_ready(video_id: str, quality: str, seek: float = 0):
-    """检查 seek 转码的分片是否就绪"""
-    seek_job = get_seekable_job(video_id, quality)
-    if not seek_job:
+    """检查指定位置的分片是否就绪"""
+    if seek <= 0:
         return {"ready": False, "segments": 0}
-    if seek > 0:
-        return {"ready": seek_job.seek_ready, "segments": seek_job.get_seek_segment_count()}
-    return {"ready": False, "segments": 0}
+    from config import HLS_SEGMENT_TIME
+    seg_idx = int(seek) // HLS_SEGMENT_TIME
+    seg_path = Path(config.get("cache_dir")) / video_id / quality / f"seg_{seg_idx:05d}.ts"
+    return {"ready": seg_path.exists(), "segments": 1 if seg_path.exists() else 0}
 
 
 @app.get("/api/video/{video_id}/stream/{quality}/{segment}")
 async def api_segment(video_id: str, quality: str, segment: str):
-    from config import HLS_SEGMENT_TIME
     seg_path = Path(config.get("cache_dir")) / video_id / quality / segment
-    if not seg_path.exists():
-        # 尝试查找对应的 seek 分片（绝对编号 → seek 文件）
-        m = re.match(r"seg_(\d+)\.ts", segment)
-        if m:
-            abs_idx = int(m.group(1))
-            seek_job = get_seekable_job(video_id, quality)
-            if seek_job and seek_job.seek_position > 0:
-                seek_start = int(seek_job.seek_position) // HLS_SEGMENT_TIME
-                seek_idx = abs_idx - seek_start
-                if seek_idx >= 0:
-                    seek_prefix = f"seek_{int(seek_job.seek_position)}"
-                    seek_path = seg_path.parent / f"{seek_prefix}_{seek_idx:05d}.ts"
-                    if seek_path.exists():
-                        return FileResponse(seek_path, media_type="video/mp2t")
-        # 返回 200 空响应，hls.js 视为 gap 而非 error，避免触发 recoverMediaError
-        return Response(content=b"", status_code=200, media_type="video/mp2t")
-    return FileResponse(seg_path, media_type="video/mp2t")
+    if seg_path.exists():
+        return FileResponse(seg_path, media_type="video/mp2t")
+    return Response(content=b"", status_code=200, media_type="video/mp2t")
 
 
 @app.get("/api/video/{video_id}/thumbnail")
@@ -221,13 +209,16 @@ async def api_thumbnail(video_id: str):
 
     thumb_path = Path(config.get("cache_dir")) / video_id / "thumb.jpg"
     if not thumb_path.exists():
-        import subprocess
         thumb_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", video["path"], "-ss", "5", "-vframes", "1",
-             "-vf", "scale=320:-1", str(thumb_path)],
-            capture_output=True, timeout=15
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", video["path"], "-ss", "5", "-vframes", "1",
+            "-vf", "scale=320:-1", str(thumb_path),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
     if thumb_path.exists():
         return FileResponse(thumb_path, media_type="image/jpeg")
     raise HTTPException(status_code=404, detail="Thumbnail generation failed")
@@ -287,6 +278,12 @@ async def api_cache_stop():
     from cache_manager import stop_batch_cache
     stop_batch_cache()
     return {"ok": True}
+
+
+@app.post("/api/cache/clear-all")
+async def api_clear_all_cache():
+    from cache_manager import clear_all_cache
+    return clear_all_cache()
 
 
 @app.get("/api/cache/batch")
@@ -359,6 +356,46 @@ async def api_evict_and_start(video_id: str, quality: str = "720p"):
     return {"ok": True}
 
 
+@app.get("/api/pretranscode/status")
+async def api_pretranscode_status():
+    from cache_manager import get_pretranscode_state
+    return get_pretranscode_state()
+
+
+@app.post("/api/pretranscode/pause")
+async def api_pretranscode_pause():
+    from cache_manager import pause_pretranscode
+    pause_pretranscode()
+    return {"ok": True}
+
+
+@app.post("/api/pretranscode/resume")
+async def api_pretranscode_resume():
+    from cache_manager import resume_pretranscode
+    resume_pretranscode()
+    return {"ok": True}
+
+
+@app.post("/api/pretranscode/stop")
+async def api_pretranscode_stop():
+    from cache_manager import stop_pretranscode
+    stop_pretranscode()
+    return {"ok": True}
+
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
+
+
+class StaticCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+
+app.add_middleware(StaticCacheMiddleware)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
@@ -366,6 +403,6 @@ if __name__ == "__main__":
     import uvicorn
     config.load_settings()
     print(f"Starting Video Streamer on http://{config.HOST}:{config.PORT}")
-    print(f"Video directory: {config.get('video_dir')}")
+    print(f"Video directories: {config.get('video_dirs')}")
     print(f"Cache directory: {config.get('cache_dir')}")
     uvicorn.run(app, host=config.HOST, port=config.PORT)

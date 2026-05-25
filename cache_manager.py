@@ -125,9 +125,7 @@ def is_cached(video_id: str, quality: str, duration: float = None) -> bool:
         return False
 
     segs = list(cache_dir.glob("seg_*.ts"))
-    seek_segs = list(cache_dir.glob("seek_*_*.ts"))
-    all_segs = segs + seek_segs
-    if not all_segs:
+    if not segs:
         return False
 
     if duration:
@@ -136,11 +134,6 @@ def is_cached(video_id: str, quality: str, duration: float = None) -> bool:
             m = re.match(r"seg_(\d+)\.ts", s.name)
             if m:
                 max_idx = max(max_idx, int(m.group(1)))
-        for s in seek_segs:
-            m = re.match(r"seek_(\d+)_(\d+)\.ts", s.name)
-            if m:
-                abs_idx = int(m.group(1)) // config.HLS_SEGMENT_TIME + int(m.group(2))
-                max_idx = max(max_idx, abs_idx)
         expected = math.ceil(duration / config.HLS_SEGMENT_TIME)
         return max_idx >= expected - 1
 
@@ -158,6 +151,31 @@ def get_cached_qualities(video_id: str) -> list[str]:
         if d.is_dir() and (d / "playlist.m3u8").exists():
             qualities.append(d.name)
     return qualities
+
+
+def clear_all_cache() -> dict:
+    """清除所有视频缓存，保留缩略图"""
+    from transcoder import invalidate_all_jobs
+    cache = Path(config.get("cache_dir"))
+    if not cache.exists():
+        return {"ok": True, "freed": 0, "msg": "无缓存"}
+
+    freed = 0
+    for video_dir in cache.iterdir():
+        if not video_dir.is_dir():
+            continue
+        for q_dir in video_dir.iterdir():
+            if not q_dir.is_dir():
+                continue
+            for f in q_dir.iterdir():
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink(missing_ok=True)
+            q_dir.rmdir()
+    invalidate_all_jobs()
+    stop_batch_cache()
+    stop_pretranscode()
+    return {"ok": True, "freed": freed}
 
 
 def clear_video_cache(video_id: str) -> dict:
@@ -361,3 +379,151 @@ def _fmt(b: int) -> str:
     if b >= 1073741824:
         return f"{b / 1073741824:.1f} GB"
     return f"{b / 1048576:.0f} MB"
+
+
+# ---------- 自动预转码 ----------
+
+_pretranscode_state = {
+    "running": False,
+    "queue": [],           # 待转码视频列表
+    "current": "",         # 当前正在转码的视频名
+    "current_video_id": "",
+    "done": 0,
+    "total": 0,
+    "paused": False,       # 暂停（用户正在播放时暂停）
+}
+_pretranscode_lock = threading.Lock()
+_pretranscode_stop_event = threading.Event()
+
+
+def get_pretranscode_state() -> dict:
+    with _pretranscode_lock:
+        return dict(_pretranscode_state)
+
+
+def stop_pretranscode():
+    _pretranscode_stop_event.set()
+    with _pretranscode_lock:
+        _pretranscode_state["running"] = False
+
+
+def pause_pretranscode():
+    with _pretranscode_lock:
+        _pretranscode_state["paused"] = True
+
+
+def resume_pretranscode():
+    with _pretranscode_lock:
+        _pretranscode_state["paused"] = False
+
+
+def start_auto_pretranscode(videos: list[dict]):
+    """启动自动预转码（后台单线程，顺序执行，最低优先级）"""
+    with _pretranscode_lock:
+        if _pretranscode_state["running"]:
+            return False
+        if _batch_state["running"]:
+            return False
+
+        # 筛选未缓存的视频
+        queue = []
+        for v in videos:
+            quality = v.get("recommended_quality", "720p")
+            if not is_cached(v["id"], quality, v.get("duration")):
+                queue.append(v)
+
+        if not queue:
+            return False
+
+        _pretranscode_stop_event.clear()
+        _pretranscode_state.update({
+            "running": True,
+            "queue": [v["name"] for v in queue],
+            "current": "",
+            "current_video_id": "",
+            "done": 0,
+            "total": len(queue),
+            "paused": False,
+        })
+
+    def _run():
+        for v in queue:
+            # 检查停止信号
+            if _pretranscode_stop_event.is_set():
+                break
+            # 批量缓存运行时暂停
+            with _batch_lock:
+                if _batch_state["running"]:
+                    break
+            # 用户暂停时等待
+            while True:
+                if _pretranscode_stop_event.is_set():
+                    break
+                with _pretranscode_lock:
+                    if not _pretranscode_state["paused"]:
+                        break
+                time.sleep(2)
+            if _pretranscode_stop_event.is_set():
+                break
+
+            vid = v["id"]
+            quality = v.get("recommended_quality", "720p")
+
+            # 再次检查是否已缓存（可能在等待期间被用户手动缓存了）
+            if is_cached(vid, quality, v.get("duration")):
+                with _pretranscode_lock:
+                    _pretranscode_state["done"] += 1
+                continue
+
+            # 检查磁盘空间
+            can, reason = can_cache_more()
+            if not can:
+                print(f"[预转码] 停止: {reason}")
+                break
+
+            with _pretranscode_lock:
+                _pretranscode_state["current"] = v["name"]
+                _pretranscode_state["current_video_id"] = vid
+
+            try:
+                from transcoder import get_or_start_transcode
+                job = get_or_start_transcode(v["path"], vid, quality)
+                while job.is_alive():
+                    if _pretranscode_stop_event.is_set():
+                        # 用户停止：终止 ffmpeg 进程
+                        if job.is_alive():
+                            try:
+                                job.process.terminate()
+                            except (ProcessLookupError, OSError):
+                                pass
+                        break
+                    with _batch_lock:
+                        if _batch_state["running"]:
+                            # 批量缓存启动，暂停预转码
+                            if job.is_alive():
+                                try:
+                                    job.process.terminate()
+                                except (ProcessLookupError, OSError):
+                                    pass
+                            break
+                    time.sleep(2)
+
+                if job.error:
+                    print(f"[预转码] 失败: {v['name']}")
+                else:
+                    print(f"[预转码] 完成: {v['name']}")
+            except Exception as e:
+                print(f"[预转码] 异常: {v['name']}: {e}")
+
+            with _pretranscode_lock:
+                _pretranscode_state["done"] += 1
+                _pretranscode_state["current"] = ""
+                _pretranscode_state["current_video_id"] = ""
+
+        with _pretranscode_lock:
+            _pretranscode_state["running"] = False
+            _pretranscode_state["current"] = ""
+            _pretranscode_state["current_video_id"] = ""
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True

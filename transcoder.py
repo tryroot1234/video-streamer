@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -9,45 +10,72 @@ from pathlib import Path
 import config
 from config import HLS_SEGMENT_TIME, QUALITY_PROFILES
 
-MIN_SEGMENTS_BEFORE_SERVE = 3
+MIN_SEGMENTS_BEFORE_SERVE = 1
+
+
+def _get_encode_bitrate(source_kbps: int, target_kbps: int) -> int:
+    """自适应码率：源码率低于目标时不放大"""
+    if source_kbps <= 0:
+        return target_kbps
+    return min(target_kbps, max(int(source_kbps * 1.2), 500))
 
 
 class TranscodeJob:
-    def __init__(self, video_path: str, video_id: str, quality: str):
+    def __init__(self, video_path: str, video_id: str, quality: str, source_bitrate_kbps: int = 0):
         self.video_path = video_path
         self.video_id = video_id
         self.quality = quality
+        self.source_bitrate_kbps = source_bitrate_kbps
         self.process: subprocess.Popen | None = None
         self.output_dir = Path(config.get("cache_dir")) / video_id / quality
-        self.playlist = self.output_dir / "playlist.m3u8"
+        self.tmp_dir = self.output_dir / "_tmp"
         self._lock = threading.Lock()
         self.started = False
-        self.ready = False  # 有足够分片可以播放
+        self.ready = False
         self.finished = False
         self.error = False
         self.paused = False
+        self._initial_process: subprocess.Popen | None = None
+
+    def _total_segments(self) -> int:
+        """从视频文件获取总时长并计算总 segment 数"""
+        try:
+            import subprocess as sp
+            result = sp.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", self.video_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            import json
+            info = json.loads(result.stdout)
+            duration = float(info["format"]["duration"])
+            return max(1, math.ceil(duration / HLS_SEGMENT_TIME))
+        except Exception:
+            return 0
+
+    def _cached_indices(self) -> set[int]:
+        """扫描缓存中已有的 segment 绝对编号"""
+        indices = set()
+        if self.output_dir.exists():
+            for f in self.output_dir.glob("seg_*.ts"):
+                m = re.match(r"seg_(\d+)\.ts", f.name)
+                if m:
+                    indices.add(int(m.group(1)))
+        return indices
 
     def _segment_count(self) -> int:
-        if not self.playlist.exists():
-            return 0
-        return len(list(self.output_dir.glob("seg_*.ts")))
+        return len(self._cached_indices())
 
-    def _seek_segment_count(self, seek_prefix: str) -> int:
-        return len(list(self.output_dir.glob(f"{seek_prefix}_*.ts")))
-
-    def start(self) -> bool:
-        with self._lock:
-            if self.started:
-                return True
-            self.started = True
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def _run_ffmpeg(self, seek_position: float = 0) -> subprocess.Popen:
+        """统一的 ffmpeg 启动（从头或从指定位置）"""
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         w, h, v_bitrate, a_bitrate = QUALITY_PROFILES[self.quality]
+        v_bitrate = _get_encode_bitrate(self.source_bitrate_kbps, v_bitrate)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-hwaccel", "videotoolbox",
+        cmd = ["ffmpeg", "-y", "-hwaccel", "videotoolbox"]
+        if seek_position > 0:
+            cmd += ["-ss", str(int(seek_position)), "-noaccurate_seek"]
+        cmd += [
             "-i", self.video_path,
             "-vf", f"scale={w}:{h}",
             "-c:v", "h264_videotoolbox",
@@ -61,38 +89,95 @@ class TranscodeJob:
             "-hls_time", str(HLS_SEGMENT_TIME),
             "-hls_list_size", "0",
             "-hls_flags", "omit_endlist",
-            "-hls_segment_filename", str(self.output_dir / "seg_%05d.ts"),
-            str(self.playlist),
+            "-hls_segment_filename", str(self.tmp_dir / "seg_%05d.ts"),
+            str(self.tmp_dir / "playlist.m3u8"),
         ]
 
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _move_segments(self, start_seg: int):
+        """后台线程：持续将完成的 segment 从临时目录移入缓存目录"""
+        next_idx = 0
+        while True:
+            tmp_file = self.tmp_dir / f"seg_{next_idx:05d}.ts"
+            next_tmp = self.tmp_dir / f"seg_{next_idx + 1:05d}.ts"
+
+            # 当前 segment 存在，且下一个也存在（说明当前已写完）或进程已结束
+            if tmp_file.exists() and (next_tmp.exists() or not self.is_alive()):
+                abs_idx = start_seg + next_idx
+                dest = self.output_dir / f"seg_{abs_idx:05d}.ts"
+                if not dest.exists():
+                    try:
+                        tmp_file.rename(dest)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        tmp_file.unlink()
+                    except OSError:
+                        pass
+                next_idx += 1
+                continue
+
+            # 进程已结束且没有更多文件
+            if not self.is_alive() and not tmp_file.exists():
+                break
+
+            time.sleep(0.5)
+
+        # 清理临时目录
         try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # 后台等待分片就绪
-            threading.Thread(target=self._wait_ready, daemon=True).start()
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def start(self) -> bool:
+        with self._lock:
+            if self.started:
+                return True
+            self.started = True
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 检查是否已完全缓存
+        cached = self._cached_indices()
+        total = self._total_segments()
+        if cached and total > 0 and max(cached) >= total - 1:
+            self.ready = True
+            self.finished = True
+            return True
+
+        try:
+            self.process = self._run_ffmpeg(0)
+            self._initial_process = self.process
+            threading.Thread(target=self._wait_ready, args=(0,), daemon=True).start()
             return True
         except Exception:
             self.started = False
             self.error = True
             return False
 
-    def _wait_ready(self):
-        """等待至少 MIN_SEGMENTS_BEFORE_SERVE 个分片生成"""
+    def _wait_ready(self, start_seg: int):
+        """等待至少 MIN_SEGMENTS_BEFORE_SERVE 个分片生成，同时持续移动 segment"""
+        # 启动 segment 移动线程
+        threading.Thread(target=self._move_segments, args=(start_seg,), daemon=True).start()
+
         timeout = 60
         waited = 0
         while waited < timeout:
             if not self.is_alive():
-                # 转码已结束（可能是出错或视频很短）
                 if self._segment_count() > 0:
                     self.ready = True
                     self.finished = True
                 else:
                     self.error = True
                 return
-            if self._segment_count() >= MIN_SEGMENTS_BEFORE_SERVE:
+            first_seg = self.output_dir / f"seg_{start_seg:05d}.ts"
+            if first_seg.exists():
                 self.ready = True
                 break
             time.sleep(1)
@@ -102,6 +187,38 @@ class TranscodeJob:
         if self.process:
             self.process.wait()
             self.finished = True
+
+    def start_seek(self, position: float) -> bool:
+        """从指定位置开始转码（跳转）"""
+        start_seg = int(position) // HLS_SEGMENT_TIME
+        cached = self._cached_indices()
+
+        # 目标 segment 已存在 → 无需转码
+        if start_seg in cached:
+            return True
+
+        # 停止旧的 seek 进程（非初始进程）
+        if self.process and self.process != self._initial_process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+
+        try:
+            self.process = self._run_ffmpeg(position)
+        except Exception:
+            return False
+
+        # 终止初始转码（seek 位置已超过初始进度）
+        if self._initial_process and self._initial_process.poll() is None:
+            try:
+                self._initial_process.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+            self._initial_process = None
+
+        threading.Thread(target=self._wait_ready, args=(start_seg,), daemon=True).start()
+        return True
 
     def is_alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -144,17 +261,17 @@ _jobs: dict[str, TranscodeJob] = {}
 _jobs_lock = threading.Lock()
 
 
-def get_or_start_transcode(video_path: str, video_id: str, quality: str) -> TranscodeJob:
+def get_or_start_transcode(video_path: str, video_id: str, quality: str,
+                           source_bitrate_kbps: int = 0) -> TranscodeJob:
     key = f"{video_id}:{quality}"
     with _jobs_lock:
         job = _jobs.get(key)
         if job and not job.error:
-            # 检查文件是否实际存在（缓存可能已被清除）
-            if job.playlist.exists() or job.is_alive():
+            if job.is_alive() or job.finished:
                 return job
             # 文件已删除，清除旧 job
             del _jobs[key]
-        job = TranscodeJob(video_path, video_id, quality)
+        job = TranscodeJob(video_path, video_id, quality, source_bitrate_kbps)
         _jobs[key] = job
     job.start()
     return job
@@ -191,206 +308,42 @@ def get_all_active_jobs() -> dict[str, dict]:
     return result
 
 
-# ---------- 可跳转转码 ----------
-
-_seek_jobs: dict[str, "SeekableTranscodeJob"] = {}
-_seek_jobs_lock = threading.Lock()
-
-
-class SeekableTranscodeJob:
-    """支持从任意位置开始新转码的转码任务"""
-
-    def __init__(self, video_path: str, video_id: str, quality: str):
-        self.video_path = video_path
-        self.video_id = video_id
-        self.quality = quality
-        self.output_dir = Path(config.get("cache_dir")) / video_id / quality
-        self.initial_job: TranscodeJob | None = None
-        self.seek_job: TranscodeJob | None = None
-        self.seek_position: float = 0
-        self.seek_ready = False
-
-    def start_initial(self) -> TranscodeJob:
-        self.initial_job = TranscodeJob(self.video_path, self.video_id, self.quality)
-        self.initial_job.start()
-        return self.initial_job
-
-    def start_seek(self, position: float) -> bool:
-        if self.seek_job and self.seek_job.is_alive():
-            if abs(self.seek_position - position) < HLS_SEGMENT_TIME * 2:
-                return True
-            self._stop_seek()
-
-        self.seek_position = position
-        self.seek_ready = False
-        seek_prefix = f"seek_{int(position)}"
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        w, h, v_bitrate, a_bitrate = QUALITY_PROFILES[self.quality]
-        cmd = [
-            "ffmpeg", "-y",
-            "-hwaccel", "videotoolbox",
-            "-ss", str(int(position)),
-            "-i", self.video_path,
-            "-vf", f"scale={w}:{h}",
-            "-c:v", "h264_videotoolbox",
-            "-b:v", f"{v_bitrate}k",
-            "-maxrate", f"{v_bitrate}k",
-            "-bufsize", f"{v_bitrate * 2}k",
-            "-c:a", "aac",
-            "-b:a", f"{a_bitrate}k",
-            "-ac", "2",
-            "-f", "hls",
-            "-hls_time", str(HLS_SEGMENT_TIME),
-            "-hls_list_size", "0",
-            "-hls_flags", "omit_endlist",
-            "-hls_segment_filename", str(self.output_dir / f"{seek_prefix}_%05d.ts"),
-            str(self.output_dir / f"{seek_prefix}.m3u8"),
-        ]
-
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            return False
-
-        # Build a lightweight wrapper
-        job = TranscodeJob.__new__(TranscodeJob)
-        job.video_path = self.video_path
-        job.video_id = self.video_id
-        job.quality = self.quality
-        job.process = proc
-        job.output_dir = self.output_dir
-        job.playlist = self.output_dir / f"{seek_prefix}.m3u8"
-        job._lock = threading.Lock()
-        job.started = True
-        job.ready = False
-        job.finished = False
-        job.error = False
-        job.paused = False
-        self.seek_job = job
-
-        threading.Thread(target=self._wait_seek_ready, daemon=True).start()
-        return True
-
-    def _wait_seek_ready(self):
-        job = self.seek_job
-        if not job:
-            return
-        seek_prefix = f"seek_{int(self.seek_position)}"
-        timeout = 60
-        waited = 0
-        while waited < timeout:
-            if not job.is_alive():
-                if job._seek_segment_count(seek_prefix) > 0:
-                    self.seek_ready = True
-                    job.finished = True
-                else:
-                    job.error = True
-                return
-            if job._seek_segment_count(seek_prefix) >= MIN_SEGMENTS_BEFORE_SERVE:
-                self.seek_ready = True
-                break
-            time.sleep(1)
-            waited += 1
-        if job.process:
-            job.process.wait()
-            job.finished = True
-
-    def _stop_seek(self):
-        if self.seek_job and self.seek_job.is_alive():
-            try:
-                self.seek_job.process.terminate()
-            except (ProcessLookupError, OSError):
-                pass
-        self.seek_job = None
-        self.seek_ready = False
-
-    def stop_seek(self):
-        self._stop_seek()
-
-    def is_seek_alive(self) -> bool:
-        return self.seek_job is not None and self.seek_job.is_alive()
-
-    def get_seek_segment_count(self) -> int:
-        if not self.seek_job:
-            return 0
-        seek_prefix = f"seek_{int(self.seek_position)}"
-        return self.seek_job._seek_segment_count(seek_prefix)
-
-    def get_seek_playlist_content(self, video_id: str, quality: str) -> str | None:
-        if not self.seek_job or not self.seek_job.playlist.exists():
-            return None
-        try:
-            content = self.seek_job.playlist.read_text(encoding="utf-8")
-            return _rewrite_seek_m3u8(content, video_id, quality, self.seek_position)
-        except Exception:
-            return None
-
-
-def _rewrite_seek_m3u8(content: str, video_id: str, quality: str, seek_position: float = 0) -> str:
-    """Rewrite seek m3u8 to use absolute segment paths and sequence numbers"""
-    prefix = f"/api/video/{video_id}/stream/{quality}/"
-    if seek_position > 0:
-        start_seg = int(seek_position) // HLS_SEGMENT_TIME
-        # 将 seek_N_XXXXX.ts 重命名为绝对编号的 seg_XXXXX.ts
-        def _replace_seg(m):
-            idx = int(m.group(1))
-            return f"seg_{start_seg + idx:05d}.ts"
-        content = re.sub(r"seek_\d+_(\d+)\.ts", _replace_seg, content)
-        content = re.sub(r"#EXT-X-MEDIA-SEQUENCE:\d+", f"#EXT-X-MEDIA-SEQUENCE:{start_seg}", content)
-    else:
-        content = re.sub(r"(seek_\d+_\d+\.ts)", prefix + r"\1", content)
-    return content
-
-
-def generate_full_m3u8(video_id: str, quality: str, duration: float, start: float = 0) -> str:
+def generate_full_m3u8(video_id: str, quality: str, duration: float, start: float = 0, is_live: bool = False) -> str:
     """动态生成覆盖完整视频时间线的 m3u8 播放列表。
 
-    扫描缓存目录中已有的 segment 文件，为未转码的位置生成占位条目。
+    扫描缓存目录中已有的 seg_NNNNN.ts 文件。
     hls.js 请求不存在的 segment 时会收到 200 空响应（视为 gap）。
 
-    start > 0 时，生成从指定秒数开始的截断 m3u8，用于 seek 后直接加载。
+    start > 0 时，生成从指定秒数开始的截断 m3u8。
+    is_live = True 时，不写 #EXT-X-ENDLIST，hls.js 会定期轮询。
     """
     cache_dir = Path(config.get("cache_dir")) / video_id / quality
     prefix = f"/api/video/{video_id}/stream/{quality}/"
     total_segments = max(1, math.ceil(duration / HLS_SEGMENT_TIME))
 
-    # 起始 segment 编号（不超过总 segment 数）
     start_seg = max(0, int(start) // HLS_SEGMENT_TIME) if start > 0 else 0
     start_seg = min(start_seg, total_segments - 1)
 
-    # 收集已存在的 segment 绝对编号
+    # 只扫描 seg_NNNNN.ts
     available = set()
-
-    # 1. 扫描 seg_NNNNN.ts（初始转码产出）
     if cache_dir.exists():
         for f in cache_dir.glob("seg_*.ts"):
             m = re.match(r"seg_(\d+)\.ts", f.name)
             if m:
                 available.add(int(m.group(1)))
 
-    # 2. 扫描 seek_*_*.ts，映射为绝对编号（仅补充不存在的）
-    if cache_dir.exists():
-        for f in cache_dir.glob("seek_*_*.ts"):
-            m = re.match(r"seek_(\d+)_(\d+)\.ts", f.name)
-            if m:
-                seek_pos = int(m.group(1))
-                seek_idx = int(m.group(2))
-                abs_idx = seek_pos // HLS_SEGMENT_TIME + seek_idx
-                if abs_idx not in available:
-                    available.add(abs_idx)
-
-    # 生成 m3u8
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        "#EXT-X-PLAYLIST-TYPE:VOD",
-        f"#EXT-X-TARGETDURATION:{HLS_SEGMENT_TIME}",
-        f"#EXT-X-MEDIA-SEQUENCE:{start_seg}",
     ]
+    if not is_live:
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    lines.append(f"#EXT-X-TARGETDURATION:{HLS_SEGMENT_TIME}")
+    lines.append(f"#EXT-X-MEDIA-SEQUENCE:{start_seg}")
 
     for i in range(start_seg, total_segments):
+        if is_live and i not in available:
+            continue
         if i < total_segments - 1:
             seg_duration = HLS_SEGMENT_TIME
         else:
@@ -398,26 +351,9 @@ def generate_full_m3u8(video_id: str, quality: str, duration: float, start: floa
         lines.append(f"#EXTINF:{seg_duration:.1f},")
         lines.append(f"{prefix}seg_{i:05d}.ts")
 
-    lines.append("#EXT-X-ENDLIST")
+    if not is_live:
+        lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
-
-
-def get_or_create_seekable(video_path: str, video_id: str, quality: str) -> SeekableTranscodeJob:
-    key = f"{video_id}:{quality}"
-    with _seek_jobs_lock:
-        job = _seek_jobs.get(key)
-        if job:
-            return job
-        job = SeekableTranscodeJob(video_path, video_id, quality)
-        _seek_jobs[key] = job
-    job.start_initial()
-    return job
-
-
-def get_seekable_job(video_id: str, quality: str) -> SeekableTranscodeJob | None:
-    key = f"{video_id}:{quality}"
-    with _seek_jobs_lock:
-        return _seek_jobs.get(key)
 
 
 def invalidate_jobs(video_id: str):
@@ -429,10 +365,15 @@ def invalidate_jobs(video_id: str):
             if job.is_alive():
                 job.process.terminate()
             del _jobs[k]
-    with _seek_jobs_lock:
-        keys_to_remove = [k for k in _seek_jobs if k.startswith(f"{video_id}:")]
-        for k in keys_to_remove:
-            job = _seek_jobs[k]
-            if job.is_seek_alive():
-                job.stop_seek()
-            del _seek_jobs[k]
+
+
+def invalidate_all_jobs():
+    """终止并清除所有转码任务"""
+    with _jobs_lock:
+        for job in _jobs.values():
+            if job.is_alive():
+                try:
+                    job.process.terminate()
+                except (ProcessLookupError, OSError):
+                    pass
+        _jobs.clear()

@@ -249,14 +249,13 @@ class TestIsCached:
         assert result is True  # 最大编号 9 >= ceil(60/6)-1 = 9
 
     def test_seek_segments_count(self, cache_dir):
-        """TC-02f: 只有 seek 分片（映射后覆盖全部）→ True"""
+        """TC-02f: seg 分片覆盖全部时长 → True"""
         from cache_manager import is_cached
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek 到 0 秒，生成 10 个 seek 分片
         for i in range(10):
-            (seg_dir / f"seek_0_{i:05d}.ts").write_bytes(b"\x00" * 100)
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
 
         with patch("config.get", return_value=str(cache_dir)):
             result = is_cached("vid1", "720p", duration=60.0)
@@ -301,7 +300,7 @@ class TestSegmentEndpoint:
     def client(self, cache_dir, video_dir):
         """创建 FastAPI 测试客户端"""
         with patch("config._settings", {
-            "video_dir": str(video_dir),
+            "video_dirs": [str(video_dir)],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -336,21 +335,14 @@ class TestSegmentEndpoint:
         assert len(resp.content) == 0
 
     def test_seek_file_mapping(self, client, cache_dir):
-        """TC-03b: 请求的 seg_NNNNN 映射到 seek 文件"""
+        """TC-03b: segment 文件不存在 → 200 空响应"""
         seg_dir = cache_dir / "test_video" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # 创建 seek_60_00000.ts（对应 seg_00010.ts）
-        (seg_dir / "seek_60_00000.ts").write_bytes(b"\x00" * 100)
 
-        # 需要 mock seekable job 的状态
-        from unittest.mock import MagicMock
-        mock_seek_job = MagicMock()
-        mock_seek_job.seek_position = 60.0
-
-        with patch("main.get_seekable_job", return_value=mock_seek_job):
-            resp = client.get("/api/video/test_video/stream/720p/seg_00010.ts")
+        resp = client.get("/api/video/test_video/stream/720p/seg_00010.ts")
 
         assert resp.status_code == 200
+        assert len(resp.content) == 0
 
 
 # ============================================================
@@ -364,7 +356,7 @@ class TestStreamEndpoint:
     @pytest.fixture
     def client(self, cache_dir, video_dir):
         with patch("config._settings", {
-            "video_dir": str(video_dir),
+            "video_dirs": [str(video_dir)],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -446,7 +438,7 @@ class TestSeekFlow:
     @pytest.fixture
     def client(self, cache_dir, video_dir):
         with patch("config._settings", {
-            "video_dir": str(video_dir),
+            "video_dirs": [str(video_dir)],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -467,10 +459,10 @@ class TestSeekFlow:
         """TC-05a: POST /seek 启动 seek 转码"""
         import time
         from unittest.mock import MagicMock
-        mock_seek_job = MagicMock()
-        mock_seek_job.start_seek.return_value = True
+        mock_job = MagicMock()
+        mock_job.start_seek.return_value = True
 
-        with patch("main.get_or_create_seekable", return_value=mock_seek_job), \
+        with patch("main.get_or_start_transcode", return_value=mock_job), \
              patch("main._last_scan", time.time()):
             resp = client.post(
                 "/api/video/test_video/seek/720p",
@@ -479,7 +471,7 @@ class TestSeekFlow:
 
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
-        mock_seek_job.start_seek.assert_called_once_with(120.0)
+        mock_job.start_seek.assert_called_once_with(120.0)
 
     def test_seek_invalid_position(self, client):
         """TC-05b: position <= 0 返回失败"""
@@ -490,30 +482,24 @@ class TestSeekFlow:
         assert resp.status_code == 200
         assert resp.json()["ok"] is False
 
-    def test_seek_ready_check(self, client):
-        """TC-05c: segments-ready 端点正确报告 seek 就绪状态"""
-        from unittest.mock import MagicMock
-        mock_seek_job = MagicMock()
-        mock_seek_job.seek_ready = True
-        mock_seek_job.get_seek_segment_count.return_value = 3
+    def test_seek_ready_check(self, client, cache_dir):
+        """TC-05c: segments-ready 端点检查 segment 文件是否存在"""
+        seg_dir = cache_dir / "test_video" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        # seek 到 120s → segment 20
+        (seg_dir / "seg_00020.ts").write_bytes(b"\x00" * 100)
 
-        with patch("main.get_seekable_job", return_value=mock_seek_job):
+        with patch("config.get", return_value=str(cache_dir)):
             resp = client.get(
                 "/api/video/test_video/stream/720p/segments-ready?seek=120"
             )
 
         assert resp.status_code == 200
         assert resp.json()["ready"] is True
-        assert resp.json()["segments"] == 3
 
-    def test_seek_not_ready(self, client):
+    def test_seek_not_ready(self, client, cache_dir):
         """TC-05d: seek 未就绪时返回 ready: false"""
-        from unittest.mock import MagicMock
-        mock_seek_job = MagicMock()
-        mock_seek_job.seek_ready = False
-        mock_seek_job.get_seek_segment_count.return_value = 0
-
-        with patch("main.get_seekable_job", return_value=mock_seek_job):
+        with patch("config.get", return_value=str(cache_dir)):
             resp = client.get(
                 "/api/video/test_video/stream/720p/segments-ready?seek=120"
             )
@@ -615,44 +601,15 @@ class TestCacheClear:
 
 
 class TestRewriteSeekM3u8:
-    """_rewrite_seek_m3u8 测试"""
+    """_rewrite_seek_m3u8 已删除（统一 segment 命名，无 seek 文件）"""
 
     def test_seek_segment_rename(self):
-        """TC-07a: seek 分片名正确映射为绝对编号"""
-        from transcoder import _rewrite_seek_m3u8
-
-        content = (
-            "#EXTM3U\n"
-            "#EXT-X-MEDIA-SEQUENCE:0\n"
-            "#EXTINF:6.0,\n"
-            "seek_60_00000.ts\n"
-            "#EXTINF:6.0,\n"
-            "seek_60_00001.ts\n"
-            "#EXTINF:6.0,\n"
-            "seek_60_00002.ts\n"
-        )
-        result = _rewrite_seek_m3u8(content, "vid1", "720p", seek_position=60.0)
-
-        # seek_60_00000 → seg_00010 (60/6 + 0)
-        assert "seg_00010.ts" in result
-        assert "seg_00011.ts" in result
-        assert "seg_00012.ts" in result
-        assert "seek_60_" not in result
-        assert "#EXT-X-MEDIA-SEQUENCE:10" in result
+        """TC-07a: 已废弃 — seek 分片不再存在"""
+        pass
 
     def test_seek_zero_position(self):
-        """TC-07b: seek_position=0 时，添加 API 前缀"""
-        from transcoder import _rewrite_seek_m3u8
-
-        content = (
-            "#EXTM3U\n"
-            "#EXT-X-MEDIA-SEQUENCE:0\n"
-            "#EXTINF:6.0,\n"
-            "seek_0_00000.ts\n"
-        )
-        result = _rewrite_seek_m3u8(content, "vid1", "720p", seek_position=0)
-
-        assert "/api/video/vid1/stream/720p/seek_0_00000.ts" in result
+        """TC-07b: 已废弃 — seek 分片不再存在"""
+        pass
 
 
 # ============================================================
@@ -949,7 +906,7 @@ class TestVideoStartBoundary:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -993,7 +950,7 @@ class TestVideoStartBoundary:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1131,7 +1088,7 @@ class TestVideoEndBoundary:
             (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1357,7 +1314,7 @@ class TestBackwardSeekAfterEviction:
             (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1371,63 +1328,54 @@ class TestBackwardSeekAfterEviction:
             assert resp.status_code == 200
 
     def test_seek_segment_resolution_mid_video(self, cache_dir):
-        """TC-19b: seek 到视频中间位置，segment 端点正确解析 seek 分片"""
+        """TC-19b: seek 到视频中间位置，segment 端点正确解析 seg 分片"""
         from fastapi.testclient import TestClient
         from unittest.mock import patch as mp
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek 到 30 秒产生的分片
-        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
-        (seg_dir / "seek_30_00001.ts").write_bytes(b"\x00" * 100)
+        # seek 到 30 秒产生的分片（统一命名：seg_00005.ts, seg_00006.ts）
+        (seg_dir / "seg_00005.ts").write_bytes(b"\x00" * 100)
+        (seg_dir / "seg_00006.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
             import main as main_module
             main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
             from main import app
+            client = TestClient(app)
 
-            # 需要 mock get_seekable_job 返回正确的 seek position
-            with mp("main.get_seekable_job") as mock_seek:
-                mock_job = type("J", (), {"seek_position": 30.0})()
-                mock_seek.return_value = mock_job
-                client = TestClient(app)
-
-                # seek_30_00000 → abs_idx = 30//6 + 0 = 5 → seg_00005.ts
-                resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
-                assert resp.status_code == 200
+            # seg_00005.ts (30//6 = 5) 直接存在
+            resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
+            assert resp.status_code == 200
+            assert len(resp.content) > 0
 
     def test_seek_segment_negative_index_returns_200_empty(self, cache_dir):
-        """TC-19c: seek 映射产生负索引时返回 200 空响应"""
+        """TC-19c: 请求不存在的 segment 时返回 200 空响应"""
         from fastapi.testclient import TestClient
         from unittest.mock import patch as mp
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek 到 30 秒，但请求 seg_00002（abs_idx=2 < seek_start=5）
-        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
+        # 不创建 seg_00002.ts
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
             import main as main_module
             main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
             from main import app
+            client = TestClient(app)
 
-            with mp("main.get_seekable_job") as mock_seek:
-                mock_job = type("J", (), {"seek_position": 30.0})()
-                mock_seek.return_value = mock_job
-                client = TestClient(app)
-
-                # seg_00002 的 abs_idx=2 < seek_start=5，seek_idx=-3 < 0
-                resp = client.get("/api/video/vid1/stream/720p/seg_00002.ts")
-                assert resp.status_code == 200
-                assert len(resp.content) == 0
+            # seg_00002 不存在，返回 200 空响应
+            resp = client.get("/api/video/vid1/stream/720p/seg_00002.ts")
+            assert resp.status_code == 200
+            assert len(resp.content) == 0
 
     def test_multiple_seek_positions_in_m3u8(self, cache_dir):
         """TC-19d: 多次 seek 产生的分片都被 generate_full_m3u8 正确收录"""
@@ -1452,62 +1400,33 @@ class TestBackwardSeekAfterEviction:
         assert "seg_00007.ts" in m3u8
         assert "seg_00008.ts" in m3u8
 
-    def test_rewrite_seek_m3u8_absolute_mapping(self, cache_dir):
-        """TC-19e: _rewrite_seek_m3u8 将 seek 分片正确映射为绝对编号"""
-        from transcoder import _rewrite_seek_m3u8
-
-        content = (
-            "#EXTM3U\n"
-            "#EXT-X-VERSION:3\n"
-            "#EXT-X-TARGETDURATION:6\n"
-            "#EXT-X-MEDIA-SEQUENCE:0\n"
-            "#EXTINF:6.0,\n"
-            "seek_30_00000.ts\n"
-            "#EXTINF:6.0,\n"
-            "seek_30_00001.ts\n"
-            "#EXTINF:6.0,\n"
-            "seek_30_00002.ts\n"
-            "#EXT-X-ENDLIST\n"
-        )
-
-        result = _rewrite_seek_m3u8(content, "vid1", "720p", seek_position=30.0)
-
-        # seek_30_00000 → seg_00005 (30//6 + 0 = 5)
-        assert "seg_00005.ts" in result
-        assert "seg_00006.ts" in result
-        assert "seg_00007.ts" in result
-        # 原始 seek 文件名不在结果中
-        assert "seek_30_00000.ts" not in result
-        # MEDIA-SEQUENCE 更新为 5
-        assert "#EXT-X-MEDIA-SEQUENCE:5" in result
+    def test_rewrite_seek_m3u8_absolute_mapping(self):
+        """TC-19e: 已废弃 — _rewrite_seek_m3u8 不再存在（统一 segment 命名）"""
+        pass
 
     def test_segment_endpoint_seek_file_not_found(self, cache_dir):
-        """TC-19f: seek 分片文件不存在时返回 200 空响应（不崩溃）"""
+        """TC-19f: segment 文件不存在时返回 200 空响应（不崩溃）"""
         from fastapi.testclient import TestClient
         from unittest.mock import patch as mp
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # 不创建任何 seek 分片文件
+        # 不创建任何 segment 文件
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
             import main as main_module
             main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
             from main import app
+            client = TestClient(app)
 
-            with mp("main.get_seekable_job") as mock_seek:
-                mock_job = type("J", (), {"seek_position": 30.0})()
-                mock_seek.return_value = mock_job
-                client = TestClient(app)
-
-                # seg_00005 不存在，seek_30_00000 也不存在
-                resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
-                assert resp.status_code == 200
-                assert len(resp.content) == 0
+            # seg_00005 不存在
+            resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
+            assert resp.status_code == 200
+            assert len(resp.content) == 0
 
 
 # ============================================================
@@ -1554,8 +1473,8 @@ class TestDeferredSeekMechanism:
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek 到 30 秒产生的分片
-        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
+        # seek 到 30 秒产生的分片（统一命名 seg_00005.ts）
+        (seg_dir / "seg_00005.ts").write_bytes(b"\x00" * 100)
 
         with patch("config.get", return_value=str(cache_dir)):
             m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0)
@@ -1563,7 +1482,7 @@ class TestDeferredSeekMechanism:
         # m3u8 仍然有 10 个条目（不是只有 seek 之后的）
         assert m3u8.count("#EXTINF:") == 10
         assert "seg_00000.ts" in m3u8
-        assert "seg_00005.ts" in m3u8  # seek_30_00000 → seg_00005
+        assert "seg_00005.ts" in m3u8
 
     def test_all_segments_accessible_via_endpoint(self, cache_dir):
         """TC-20d: 所有 segment 都可通过端点访问（已转码的返回 200 有内容，未转码的返回 200 空）"""
@@ -1577,7 +1496,7 @@ class TestDeferredSeekMechanism:
             (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1605,26 +1524,23 @@ class TestDeferredSeekMechanism:
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek 到 30 秒产生的分片 (30//6=5)
-        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
+        # seek 到 30 秒产生的分片（统一命名 seg_00005.ts）
+        (seg_dir / "seg_00005.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
             import main as main_module
             main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
             from main import app
+            client = TestClient(app)
 
-            with mp("main.get_seekable_job") as mock_seek:
-                mock_job = type("J", (), {"seek_position": 30.0})()
-                mock_seek.return_value = mock_job
-                client = TestClient(app)
-
-                # seek_30_00000 → seg_00005，端点正确解析
-                resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
-                assert resp.status_code == 200
+            # seg_00005 直接存在，端点正确返回
+            resp = client.get("/api/video/vid1/stream/720p/seg_00005.ts")
+            assert resp.status_code == 200
+            assert len(resp.content) > 0
 
     def test_buffer_coverage_guarantee(self, cache_dir):
         """TC-20f: 从 segment 0 开始顺序加载，缓冲覆盖保证（每个 segment 都有有效 EXTINF）"""
@@ -1694,7 +1610,7 @@ class TestHandleVideoSeekSafety:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1747,7 +1663,7 @@ class TestSegmentEndpoint200Empty:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1766,7 +1682,7 @@ class TestSegmentEndpoint200Empty:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1789,7 +1705,7 @@ class TestSegmentEndpoint200Empty:
         (seg_dir / "seg_00000.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1803,33 +1719,28 @@ class TestSegmentEndpoint200Empty:
             assert len(resp.content) == 100
 
     def test_seek_file_missing_returns_200_empty(self, cache_dir):
-        """TC-22d: seek 分片不存在时也返回 200 空响应"""
+        """TC-22d: segment 文件不存在时返回 200 空响应"""
         from fastapi.testclient import TestClient
         from unittest.mock import patch as mp
 
         seg_dir = cache_dir / "vid1" / "720p"
         seg_dir.mkdir(parents=True, exist_ok=True)
-        # seek_30_00000 存在但 seg_00005 不存在
-        (seg_dir / "seek_30_00000.ts").write_bytes(b"\x00" * 100)
+        # 不创建任何 segment 文件
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
             import main as main_module
             main_module._video_cache = {"vid1": {"id": "vid1", "name": "v", "path": "/tmp/v.mp4", "duration": 60.0}}
             from main import app
+            client = TestClient(app)
 
-            with mp("main.get_seekable_job") as mock_seek:
-                mock_job = type("J", (), {"seek_position": 30.0})()
-                mock_seek.return_value = mock_job
-                client = TestClient(app)
-
-                # seg_00006 不存在，seek_30_00001 也不存在
-                resp = client.get("/api/video/vid1/stream/720p/seg_00006.ts")
-                assert resp.status_code == 200
-                assert len(resp.content) == 0
+            # seg_00006 不存在，返回 200 空响应
+            resp = client.get("/api/video/vid1/stream/720p/seg_00006.ts")
+            assert resp.status_code == 200
+            assert len(resp.content) == 0
 
     def test_invalid_segment_name_returns_200(self, cache_dir):
         """TC-22e: 无效 segment 文件名也返回 200 空响应"""
@@ -1837,7 +1748,7 @@ class TestSegmentEndpoint200Empty:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1904,7 +1815,7 @@ class TestSeekDebounce:
             (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1956,7 +1867,7 @@ class TestNoRecoverMediaError:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -1976,7 +1887,7 @@ class TestNoRecoverMediaError:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -2139,7 +2050,7 @@ class TestM3u8StartParameter:
         from unittest.mock import patch as mp
 
         with mp("config._settings", {
-            "video_dir": "/tmp",
+            "video_dirs": ["/tmp"],
             "cache_dir": str(cache_dir),
             "max_cache_size_gb": 50,
         }):
@@ -2156,3 +2067,519 @@ class TestM3u8StartParameter:
             assert "#EXT-X-MEDIA-SEQUENCE:5" in resp.text
             assert "seg_00005.ts" in resp.text
             assert "seg_00000.ts" not in resp.text
+
+
+# ============================================================
+# TC-26: Safari 播放控件结构性验证
+# ============================================================
+
+
+class TestSafariPlayerControls:
+    """Safari 播放控件代码结构验证（读取 library.js 源码验证关键模式）"""
+
+    @staticmethod
+    def _read_library_js():
+        js_path = Path(__file__).parent / "static" / "library.js"
+        return js_path.read_text(encoding="utf-8")
+
+    def test_goback_resets_pending_seek_time(self):
+        """TC-26a: goBack() 清理 overlay（hideLoading 替代 hideSeekOverlay）"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match, "goBack() function not found"
+        goback_body = goback_match.group(1)
+        assert "hideLoading()" in goback_body, \
+            "goBack() does not call hideLoading()"
+        assert "_pendingSeekTime" not in js, \
+            "_pendingSeekTime should have been removed"
+
+    def test_goback_resets_initial_seek_done(self):
+        """TC-26b: goBack() 重置 initialSeekDone"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "_resetPlayerState()" in goback_match.group(1)
+
+    def test_goback_resets_max_buffered_end(self):
+        """TC-26c: goBack() 重置 maxSeekPosition"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "maxSeekPosition = 0" in goback_match.group(1)
+
+    def test_goback_resets_seeking_in_progress(self):
+        """TC-26d: goBack() 重置 seekingInProgress"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "_resetPlayerState()" in goback_match.group(1)
+
+    def test_goback_sets_destroyed_flag(self):
+        """TC-26e: goBack() 设置 destroyed = true"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "playerState.destroyed = true" in goback_match.group(1)
+
+    def test_goback_destroys_hls(self):
+        """TC-26f: goBack() 销毁 hls 实例"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "hls.destroy()" in goback_match.group(1)
+        assert "hls = null" in goback_match.group(1)
+
+    def test_goback_pauses_video(self):
+        """TC-26g: goBack() 暂停视频"""
+        js = self._read_library_js()
+        goback_match = re.search(r"function goBack\(\)\s*\{(.+?)\n\}", js, re.DOTALL)
+        assert goback_match
+        assert "video.pause()" in goback_match.group(1)
+
+    def test_switchquality_frag_buffered_has_video_id_guard(self):
+        """TC-26h: _createHlsInstance FRAG_BUFFERED 回调包含 videoId 守卫"""
+        js = self._read_library_js()
+        # FRAG_BUFFERED 逻辑已提取到 _createHlsInstance 中
+        assert "currentVideo?.id !== videoId" in js, \
+            "_createHlsInstance FRAG_BUFFERED missing videoId guard"
+
+    def test_switchquality_frag_buffered_has_destroyed_guard(self):
+        """TC-26i: switchQuality FRAG_BUFFERED 回调包含 destroyed 守卫"""
+        js = self._read_library_js()
+        # _createHlsInstance 中包含 destroyed 守卫
+        assert "playerState.destroyed" in js, \
+            "library.js missing playerState.destroyed guard"
+
+    def test_handlevideoseek_frag_buffered_has_video_id_guard(self):
+        """TC-26j: _seekTo 包含 videoId 守卫（seek 逻辑已合并到 _seekTo）"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match, "_seekTo() function not found"
+        seek_body = seek_match.group(1)
+        assert "currentVideo?.id !== videoId" in seek_body, \
+            "_seekTo missing videoId guard"
+
+    def test_handlevideoseek_frag_buffered_has_destroyed_guard(self):
+        """TC-26k: _createHlsInstance FRAG_BUFFERED 回调包含 destroyed 守卫"""
+        js = self._read_library_js()
+        # FRAG_BUFFERED 逻辑已提取到 _createHlsInstance 中
+        assert "playerState.destroyed" in js, \
+            "_createHlsInstance FRAG_BUFFERED missing destroyed guard"
+
+    def test_handlevideoseek_poll_checks_video_switch(self):
+        """TC-26l: _seekTo 轮询循环检查视频是否已切换"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match, "_seekTo() function not found"
+        seek_body = seek_match.group(1)
+        assert "currentVideo?.id !== videoId" in seek_body, \
+            "_seekTo poll loop missing video switch check"
+
+    def test_handlevideoseek_poll_checks_destroyed(self):
+        """TC-26m: _seekTo 轮询循环检查 destroyed"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match, "_seekTo() function not found"
+        seek_body = seek_match.group(1)
+        assert "playerState.destroyed" in seek_body, \
+            "_seekTo poll loop missing destroyed check"
+
+    def test_handlevideoseek_debounce_present(self):
+        """TC-26n: handleVideoSeek 包含防抖逻辑"""
+        js = self._read_library_js()
+        hv_match = re.search(r"function handleVideoSeek\(video, quality\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert hv_match
+        hv_body = hv_match.group(1)
+        assert "SEEK_DEBOUNCE_MS" in hv_body, \
+            "handleVideoSeek missing debounce logic"
+        assert "lastSeekTime" in hv_body, \
+            "handleVideoSeek missing lastSeekTime check"
+
+    def test_handlevideoseek_skips_when_seeking_in_progress(self):
+        """TC-26o: handleVideoSeek 在 seekingInProgress 时跳过"""
+        js = self._read_library_js()
+        hv_match = re.search(r"function handleVideoSeek\(video, quality\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert hv_match
+        hv_body = hv_match.group(1)
+        early_body = hv_body[:200]
+        assert "seekingInProgress" in early_body, \
+            "handleVideoSeek does not check seekingInProgress early"
+
+    def test_handlevideoseek_skips_before_initial_seek(self):
+        """TC-26p: handleVideoSeek 在 initialSeekDone 为 false 时跳过"""
+        js = self._read_library_js()
+        hv_match = re.search(r"function handleVideoSeek\(video, quality\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert hv_match
+        hv_body = hv_match.group(1)
+        early_body = hv_body[:300]
+        assert "initialSeekDone" in early_body, \
+            "handleVideoSeek does not check initialSeekDone early"
+
+    def test_handlevideoseek_destroys_old_hls_before_new(self):
+        """TC-26q: _createHlsInstance 先销毁旧 hls 再创建新实例"""
+        js = self._read_library_js()
+        ci_match = re.search(r"function _createHlsInstance\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert ci_match, "_createHlsInstance() function not found"
+        ci_body = ci_match.group(1)
+        destroy_pos = ci_body.find("hls.destroy()")
+        assert destroy_pos >= 0, "_createHlsInstance missing hls.destroy()"
+        new_hls_pos = ci_body.find("new Hls(", destroy_pos)
+        assert new_hls_pos > destroy_pos, \
+            "_createHlsInstance creates new Hls before destroying old one"
+
+    def test_handlevideoseek_sets_currenttime_after_frag_buffered(self):
+        """TC-26r: _reloadHlsAtPosition 在 FRAG_BUFFERED 后设置 currentTime（Safari 兼容）"""
+        js = self._read_library_js()
+        rl_match = re.search(r"function _reloadHlsAtPosition\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert rl_match
+        rl_body = rl_match.group(1)
+        assert "video.currentTime = targetTime" in rl_body, \
+            "_reloadHlsAtPosition should set currentTime using targetTime in FRAG_BUFFERED"
+        assert "video.currentTime = seekTime" not in rl_body, \
+            "_reloadHlsAtPosition should not set currentTime with seekTime"
+
+    def test_handlevideoseek_detaches_onseeking_before_loadsource(self):
+        """TC-26s: _reloadHlsAtPosition 在 _createHlsInstance 前移除 onseeking 防止递归"""
+        js = self._read_library_js()
+        rl_match = re.search(r"function _reloadHlsAtPosition\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert rl_match
+        rl_body = rl_match.group(1)
+        detach_pos = rl_body.find("video.onseeking = null")
+        ci_pos = rl_body.find("_createHlsInstance(")
+        assert detach_pos >= 0, "_reloadHlsAtPosition missing video.onseeking = null"
+        assert ci_pos >= 0, "_reloadHlsAtPosition missing _createHlsInstance call"
+        assert detach_pos < ci_pos, \
+            "_reloadHlsAtPosition does not detach onseeking before _createHlsInstance"
+
+    def test_recover_media_error_in_reload_hls(self):
+        """TC-26t: _reloadHlsAtPosition 包含 recoverMediaError 调用"""
+        js = self._read_library_js()
+        assert "recoverMediaError" in js, \
+            "library.js should contain recoverMediaError for MEDIA_ERROR recovery"
+
+    def test_seek_debounce_constant_defined(self):
+        """TC-26u: SEEK_DEBOUNCE_MS 常量已定义且合理"""
+        js = self._read_library_js()
+        match = re.search(r"SEEK_DEBOUNCE_MS\s*=\s*(\d+)", js)
+        assert match, "SEEK_DEBOUNCE_MS not defined"
+        value = int(match.group(1))
+        assert 200 <= value <= 5000, f"SEEK_DEBOUNCE_MS={value} seems unreasonable"
+
+    def test_destroyed_flag_defined(self):
+        """TC-26v: destroyed 标志已定义"""
+        js = self._read_library_js()
+        assert "destroyed: false" in js, \
+            "destroyed flag not initialized in playerState"
+
+    def test_switchquality_resets_destroyed_flag(self):
+        """TC-26w: switchQuality 重置 destroyed（新播放会话）"""
+        js = self._read_library_js()
+        sq_match = re.search(r"function switchQuality\(quality\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert sq_match
+        assert "_resetPlayerState()" in sq_match.group(1), \
+            "switchQuality does not call _resetPlayerState()"
+
+    def test_maxbuffered_end_monotonic(self):
+        """TC-26x: maxSeekPosition 单调递增（Safari buffer 回收后仍能判断 segment 已转码）"""
+        js = self._read_library_js()
+        # _createHlsInstance FRAG_BUFFERED 回调中 maxSeekPosition 只应增长
+        ci_match = re.search(r"function _createHlsInstance\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert ci_match
+        ci_body = ci_match.group(1)
+        frag_section = ci_body[ci_body.index("FRAG_BUFFERED"):]
+        # FRAG_BUFFERED 内不应有 maxSeekPosition = 0 的重置
+        assert "maxSeekPosition = 0" not in frag_section, \
+            "FRAG_BUFFERED callback resets maxSeekPosition to 0 (should be monotonic)"
+        # _seekTo 中不应重置 maxSeekPosition（已合并到 _seekTo）
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match
+        seek_body = seek_match.group(1)
+        assert "maxSeekPosition = 0" not in seek_body, \
+            "_seekTo resets maxSeekPosition to 0 (should be monotonic)"
+
+
+# ============================================================
+# TC-27: is_live 直播模式 m3u8（边转码边播放）
+# ============================================================
+
+
+class TestLiveM3u8:
+    """is_live 模式下 m3u8 生成测试（无 ENDLIST，hls.js 轮询）"""
+
+    def test_live_no_endlist(self, cache_dir):
+        """TC-27a: is_live=True 时不包含 #EXT-X-ENDLIST"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert "#EXT-X-ENDLIST" not in m3u8
+
+    def test_live_no_vod_type(self, cache_dir):
+        """TC-27b: is_live=True 时不包含 #EXT-X-PLAYLIST-TYPE:VOD"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" not in m3u8
+
+    def test_live_has_targetduration(self, cache_dir):
+        """TC-27c: is_live=True 时仍包含 #EXT-X-TARGETDURATION"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert "#EXT-X-TARGETDURATION:6" in m3u8
+
+    def test_live_has_media_sequence(self, cache_dir):
+        """TC-27d: is_live=True 时仍包含 #EXT-X-MEDIA-SEQUENCE"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert "#EXT-X-MEDIA-SEQUENCE:0" in m3u8
+
+    def test_live_has_all_segments(self, cache_dir):
+        """TC-27e: is_live=True 时只列出已转码的 segment 条目"""
+        from transcoder import generate_full_m3u8
+
+        seg_dir = cache_dir / "vid1" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(10):
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert m3u8.count("#EXTINF:") == 10
+        assert "seg_00000.ts" in m3u8
+        assert "seg_00009.ts" in m3u8
+
+    def test_live_only_available_segments(self, cache_dir):
+        """TC-27e2: is_live=True 时未转码的 segment 不在 m3u8 中"""
+        from transcoder import generate_full_m3u8
+
+        seg_dir = cache_dir / "vid1" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        # 只创建前 3 个 segment
+        for i in range(3):
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        # 只有 3 个 segment 在 m3u8 中
+        assert m3u8.count("#EXTINF:") == 3
+        assert "seg_00000.ts" in m3u8
+        assert "seg_00002.ts" in m3u8
+        # 未转码的不在
+        assert "seg_00003.ts" not in m3u8
+        assert "seg_00009.ts" not in m3u8
+
+    def test_live_with_start_parameter(self, cache_dir):
+        """TC-27f: is_live=True + start=30 时截断，只含已转码 segment，无 ENDLIST"""
+        from transcoder import generate_full_m3u8
+
+        seg_dir = cache_dir / "vid1" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        # 创建 start 之后的 segment（seg_00005 ~ seg_00009）
+        for i in range(5, 10):
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, start=30, is_live=True)
+
+        assert "#EXT-X-ENDLIST" not in m3u8
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" not in m3u8
+        assert "#EXT-X-MEDIA-SEQUENCE:5" in m3u8
+        assert m3u8.count("#EXTINF:") == 5
+
+    def test_default_is_not_live(self, cache_dir):
+        """TC-27g: 默认 is_live=False 时包含 ENDLIST 和 VOD"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0)
+
+        assert "#EXT-X-ENDLIST" in m3u8
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" in m3u8
+
+    def test_live_is_valid_m3u8(self, cache_dir):
+        """TC-27h: is_live=True 生成的 m3u8 以 #EXTM3U 开头"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+
+        assert m3u8.startswith("#EXTM3U\n")
+
+    def test_live_duration_zero(self, cache_dir):
+        """TC-27i: is_live=True + duration=0，无 segment 可用时 m3u8 为空列表"""
+        from transcoder import generate_full_m3u8
+
+        with patch("config.get", return_value=str(cache_dir)):
+            m3u8 = generate_full_m3u8("vid1", "720p", duration=0.0, is_live=True)
+
+        assert "#EXT-X-ENDLIST" not in m3u8
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" not in m3u8
+        assert "#EXT-X-TARGETDURATION:6" in m3u8
+
+    def test_live_seg_extinf_correct(self, cache_dir):
+        """TC-27j: is_live=True 时 segment EXTINF 时长与正常模式一致"""
+        from transcoder import generate_full_m3u8
+
+        seg_dir = cache_dir / "vid1" / "720p"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(10):
+            (seg_dir / f"seg_{i:05d}.ts").write_bytes(b"\x00" * 100)
+
+        with patch("config.get", return_value=str(cache_dir)):
+            live = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=True)
+            vod = generate_full_m3u8("vid1", "720p", duration=60.0, is_live=False)
+
+        live_extinf = [l for l in live.split("\n") if l.startswith("#EXTINF:")]
+        vod_extinf = [l for l in vod.split("\n") if l.startswith("#EXTINF:")]
+        assert live_extinf == vod_extinf
+
+    def test_stream_endpoint_live_when_transcoding(self, cache_dir, video_dir):
+        """TC-27k: stream 端点在转码进行中返回 live m3u8（无 ENDLIST）"""
+        from unittest.mock import MagicMock
+
+        mock_job = MagicMock()
+        mock_job.is_alive.return_value = True
+        mock_job.finished = False
+        mock_job.wait_ready.return_value = True
+
+        with patch("config._settings", {
+            "video_dirs": [str(video_dir)],
+            "cache_dir": str(cache_dir),
+            "max_cache_size_gb": 50,
+        }):
+            import main as main_module
+            main_module._video_cache = {
+                "vid1": {"id": "vid1", "name": "v", "path": str(video_dir / "test_video.mp4"), "duration": 60.0}
+            }
+            from fastapi.testclient import TestClient
+            from main import app
+            client = TestClient(app)
+
+            with patch("main.is_cached", return_value=False), \
+                 patch("main.get_or_start_transcode", return_value=mock_job), \
+                 patch("main.get_job", return_value=mock_job):
+                resp = client.get("/api/video/vid1/stream/720p")
+
+        assert resp.status_code == 200
+        assert "#EXT-X-ENDLIST" not in resp.text
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" not in resp.text
+
+    def test_stream_endpoint_vod_when_transcode_done(self, cache_dir, video_dir):
+        """TC-27l: stream 端点在转码完成后返回 VOD m3u8（有 ENDLIST）"""
+        from unittest.mock import MagicMock
+
+        mock_job = MagicMock()
+        mock_job.is_alive.return_value = False
+        mock_job.finished = True
+
+        with patch("config._settings", {
+            "video_dirs": [str(video_dir)],
+            "cache_dir": str(cache_dir),
+            "max_cache_size_gb": 50,
+        }):
+            import main as main_module
+            main_module._video_cache = {
+                "vid1": {"id": "vid1", "name": "v", "path": str(video_dir / "test_video.mp4"), "duration": 60.0}
+            }
+            from fastapi.testclient import TestClient
+            from main import app
+            client = TestClient(app)
+
+            with patch("main.is_cached", return_value=True), \
+                 patch("main.get_job", return_value=mock_job):
+                resp = client.get("/api/video/vid1/stream/720p")
+
+        assert resp.status_code == 200
+        assert "#EXT-X-ENDLIST" in resp.text
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" in resp.text
+
+
+# ============================================================
+# TC-28: Safari backward seek 修复验证
+# ============================================================
+
+
+class TestSafariBackwardSeek:
+    """Safari backward seek 修复的代码结构验证"""
+
+    @staticmethod
+    def _read_library_js():
+        js_path = Path(__file__).parent / "static" / "library.js"
+        return js_path.read_text(encoding="utf-8")
+
+    def test_handlevideoseek_has_two_paths(self):
+        """TC-28a: _seekTo 区分已转码范围和未转码范围两条路径"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match, "_seekTo() not found"
+        seek_body = seek_match.group(1)
+        assert "targetTime < playerState.maxSeekPosition" in seek_body, \
+            "_seekTo missing fast path for already-transcoded range"
+
+    def test_backward_seek_fast_path_no_transcode(self):
+        """TC-28b: 已转码范围的 seek 不调用 seek 转码 API"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match
+        seek_body = seek_match.group(1)
+        fast_path = seek_body[:seek_body.find("targetTime < playerState.maxSeekPosition") + 200]
+        assert "return;" in fast_path, \
+            "Fast path for already-transcoded seek should return early"
+
+    def test_backward_seek_fast_path_uses_start_param(self):
+        """TC-28c: _seekTo 超出转码范围时调用 _reloadHlsAtPosition（含 ?start= 参数）"""
+        js = self._read_library_js()
+        assert "?start=" in js, \
+            "_reloadHlsAtPosition should use ?start= parameter in loadSource"
+        assert "_reloadHlsAtPosition(" in js, \
+            "_seekTo should call _reloadHlsAtPosition"
+
+    def test_seek_within_buffer_returns_early(self):
+        """TC-28d: _seekTo 在已缓冲范围内直接返回（不触发任何操作）"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match
+        seek_body = seek_match.group(1)
+        buffer_check = seek_body.find("targetTime >= buf.start(i) && targetTime <= buf.end(i)")
+        maxbuf_check = seek_body.find("targetTime < playerState.maxSeekPosition")
+        assert buffer_check > 0, "Missing buffer range check"
+        assert maxbuf_check > buffer_check, \
+            "Buffer range check should come before maxSeekPosition check"
+
+    def test_no_maxbuffered_reset_in_handlevideoseek(self):
+        """TC-28e: _seekTo 中不重置 maxSeekPosition"""
+        js = self._read_library_js()
+        seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert seek_match
+        seek_body = seek_match.group(1)
+        assert "maxSeekPosition = 0" not in seek_body, \
+            "_seekTo should not reset maxSeekPosition (monotonic invariant)"
+
+    def test_fast_path_still_updates_maxbuffered(self):
+        """TC-28f: _createHlsInstance 的 FRAG_BUFFERED 回调单调更新 maxSeekPosition"""
+        js = self._read_library_js()
+        ci_match = re.search(r"function _createHlsInstance\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert ci_match, "_createHlsInstance() not found"
+        ci_body = ci_match.group(1)
+        assert "maxSeekPosition" in ci_body, \
+            "_createHlsInstance FRAG_BUFFERED should update maxSeekPosition"
+
+    def test_fast_path_restores_onseeking(self):
+        """TC-28g: _reloadHlsAtPosition 恢复 onseeking 处理器"""
+        js = self._read_library_js()
+        rl_match = re.search(r"function _reloadHlsAtPosition\(.+?\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
+        assert rl_match
+        rl_body = rl_match.group(1)
+        assert "video.onseeking" in rl_body, \
+            "_reloadHlsAtPosition should restore onseeking handler after seek"

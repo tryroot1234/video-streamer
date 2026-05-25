@@ -1,6 +1,17 @@
+/**
+ * 播放器控件 — 周易之道
+ *
+ * 简易：一个入口（_seekTo）处理所有跳转，一个 overlay（showLoading）管理所有加载状态
+ * 变易：状态驱动 UI，事件通过 _playerListeners 统一注册和清理
+ * 不易：用户意图不变 — 点击进度条 → 跳转 → 播放
+ *
+ * 第一性原理：从「用户想看视频某个位置」出发推导代码结构
+ */
+
 let hls = null;
 let currentVideo = null;
 let currentQuality = null;
+let _loadedMetadataHandler = null;
 
 let allVideos = [];
 let currentPage = 1;
@@ -17,12 +28,32 @@ async function loadSettings() {
     try {
         const res = await fetch("/api/settings");
         const s = await res.json();
-        document.getElementById("input-video-dir").value = s.video_dir || "";
+        renderVideoDirs(s.video_dirs || []);
         document.getElementById("input-cache-dir").value = s.cache_dir || "";
         document.getElementById("input-max-cache").value = s.max_cache_size_gb || 50;
     } catch (e) {
         console.error("Failed to load settings", e);
     }
+}
+
+function renderVideoDirs(dirs) {
+    const container = document.getElementById("video-dirs-list");
+    container.innerHTML = "";
+    dirs.forEach((dir, i) => {
+        const row = document.createElement("div");
+        row.className = "dir-row";
+        row.innerHTML = `<input type="text" class="dir-input" value="${dir}"><button class="dir-remove-btn" onclick="this.parentElement.remove()">✕</button>`;
+        container.appendChild(row);
+    });
+}
+
+function addVideoDir() {
+    const container = document.getElementById("video-dirs-list");
+    const row = document.createElement("div");
+    row.className = "dir-row";
+    row.innerHTML = `<input type="text" class="dir-input" value="" placeholder="/path/to/videos"><button class="dir-remove-btn" onclick="this.parentElement.remove()">✕</button>`;
+    container.appendChild(row);
+    row.querySelector("input").focus();
 }
 
 async function saveSettings() {
@@ -31,8 +62,11 @@ async function saveSettings() {
     btn.disabled = true;
     msg.classList.add("hidden");
 
+    const dirInputs = document.querySelectorAll("#video-dirs-list .dir-input");
+    const video_dirs = Array.from(dirInputs).map(el => el.value.trim()).filter(Boolean);
+
     const body = {
-        video_dir: document.getElementById("input-video-dir").value.trim(),
+        video_dirs,
         cache_dir: document.getElementById("input-cache-dir").value.trim(),
         max_cache_size_gb: parseInt(document.getElementById("input-max-cache").value, 10),
     };
@@ -267,6 +301,27 @@ async function stopBatchCache() {
     await fetch("/api/cache/stop", {method: "POST"});
 }
 
+async function clearAllCache() {
+    if (!confirm("确定清除所有视频缓存？此操作不可撤销。")) return;
+    const btn = document.getElementById("cache-clear-all-btn");
+    btn.disabled = true;
+    btn.textContent = "清除中...";
+    try {
+        const res = await fetch("/api/cache/clear-all", {method: "POST"});
+        const data = await res.json();
+        if (data.ok) {
+            btn.textContent = `已清除 ${formatSize(data.freed)}`;
+            setTimeout(() => { btn.textContent = "一键清除全部"; btn.disabled = false; }, 3000);
+        } else {
+            btn.textContent = "清除失败";
+            setTimeout(() => { btn.textContent = "一键清除全部"; btn.disabled = false; }, 2000);
+        }
+    } catch (e) {
+        btn.textContent = "清除失败";
+        setTimeout(() => { btn.textContent = "一键清除全部"; btn.disabled = false; }, 2000);
+    }
+}
+
 function pollBatchProgress() {
     if (batchPollTimer) clearInterval(batchPollTimer);
     batchPollTimer = setInterval(async () => {
@@ -352,6 +407,24 @@ function pollActiveProgress() {
                 const vid = btn.id.replace("pgk-", "");
                 if (!activeIds.has(vid)) btn.classList.add("hidden");
             });
+
+            // 预转码状态
+            try {
+                const ptRes = await fetch("/api/pretranscode/status");
+                const pt = await ptRes.json();
+                const el = document.getElementById("pretranscode-status");
+                if (!el) return;
+                if (pt.running && pt.total > 0) {
+                    el.classList.remove("hidden");
+                    if (pt.current) {
+                        el.innerHTML = `<div class="mini-spinner"></div> 预转码中: ${pt.current} (${pt.done}/${pt.total})`;
+                    } else {
+                        el.innerHTML = `<div class="mini-spinner"></div> 预转码准备中 (${pt.done}/${pt.total})`;
+                    }
+                } else {
+                    el.classList.add("hidden");
+                }
+            } catch (_) {}
         } catch (e) {
             // ignore
         }
@@ -550,14 +623,20 @@ function showLoadingOverlay(video, quality) {
 
 function doPlay(video) {
     currentVideo = video;
-    _maxBufferedEnd = 0;
-    _seekingInProgress = false;
+    playerState.maxSeekPosition = 0;
+    _resetPlayerState();
+    const clearBtn = document.getElementById("clear-cache-btn");
+    clearBtn.textContent = "清除缓存";
+    clearBtn.disabled = false;
     document.getElementById("library").classList.add("hidden");
     document.getElementById("player-section").classList.remove("hidden");
     document.getElementById("toolbar").classList.add("hidden");
     document.getElementById("pagination").classList.add("hidden");
     document.getElementById("batch-progress").classList.add("hidden");
     document.getElementById("disk-warning").classList.add("hidden");
+
+    // 暂停预转码，避免与播放竞争资源
+    fetch("/api/pretranscode/pause", { method: "POST" }).catch(() => {});
 
     const select = document.getElementById("quality-select");
     select.innerHTML = "";
@@ -579,226 +658,583 @@ function doPlay(video) {
         ${video.codec}
     `;
 
+    const vidEl = document.getElementById("video-player");
+    const wrapper = document.querySelector(".player-wrapper");
+
+    // Safari / iOS：原生控件模式（原生 HLS 处理更稳定）
+    const ua = navigator.userAgent;
+    const isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isDesktopSafari = !isIOS && /safari/i.test(ua) && !/chrome|crios|fxios|edg/i.test(ua);
+    if ((isIOS || isDesktopSafari) && vidEl.canPlayType("application/vnd.apple.mpegurl")) {
+        playerState.nativeHls = true;
+        playerState.nativeControls = true;
+        vidEl.controls = true;
+        wrapper.classList.add("native-controls-mode");
+
+        const streamUrl = `/api/video/${encodeURIComponent(video.id)}/stream/${video.recommended_quality}`;
+        vidEl.muted = true;
+        vidEl.src = streamUrl;
+        const onMeta = () => {
+            vidEl.removeEventListener("loadedmetadata", onMeta);
+            vidEl.currentTime = 0;
+            vidEl.play().catch(() => {});
+            playerState.initialSeekDone = true;
+        };
+        vidEl.addEventListener("loadedmetadata", onMeta, { once: true });
+
+        // 追踪已缓冲范围（供画质切换等使用）
+        _listen(vidEl, "timeupdate", () => {
+            const buf = vidEl.buffered;
+            for (let i = 0; i < buf.length; i++) {
+                if (buf.end(i) > playerState.maxSeekPosition) {
+                    playerState.maxSeekPosition = buf.end(i);
+                }
+            }
+        });
+
+        currentQuality = video.recommended_quality;
+        hideLoading();
+        setupTimeDisplay();
+        return;
+    }
+
+    // Chrome / Safari 17+：hls.js + 自定义控件
+    vidEl.controls = false;
+    wrapper.classList.remove("native-controls-mode");
+
+    _listen(vidEl, "play", _updatePlayPauseIcon);
+    _listen(vidEl, "pause", _updatePlayPauseIcon);
+    _listen(vidEl, "click", _onVideoClick);
+    _listen(document.getElementById("progress-container"), "click", _onProgressClick);
+    _listen(document.getElementById("progress-container"), "touchstart", _onProgressTouchStart);
+    _listen(document.getElementById("progress-container"), "touchmove", _onProgressTouchMove);
+    _listen(document.getElementById("progress-container"), "touchend", _onProgressTouchEnd);
+    _listen(document, "keydown", _onKeydown);
+
+    // 重置进度条
+    document.getElementById("progress-played").style.width = "0%";
+    document.getElementById("progress-buffered").style.width = "0%";
+    document.getElementById("progress-transcoded").style.width = "0%";
+    document.getElementById("progress-handle").style.left = "0%";
+    document.getElementById("ctrl-time").textContent = "0:00 / " + formatDuration(video.duration);
+    hideLoading();
+
     switchQuality(video.recommended_quality);
     setupTimeDisplay();
 }
 
-let _seekingInProgress = false;
-let _maxBufferedEnd = 0;
-let _initialSeekDone = false;
-let _pendingSeekTime = null;
-let _destroyed = false;
-let _lastSeekTime = 0;
-const SEEK_DEBOUNCE_MS = 800;
+// ---------- Player State ----------
+
+const _playerListeners = [];
+function _listen(el, evt, fn) {
+    el.addEventListener(evt, fn);
+    _playerListeners.push([el, evt, fn]);
+}
+
+function showLoading(msg) {
+    const el = document.getElementById("loading-overlay");
+    if (el) {
+        if (msg) document.getElementById("loading-overlay-msg").textContent = msg;
+        el.classList.remove("hidden");
+    }
+}
+
+function hideLoading() {
+    document.getElementById("loading-overlay")?.classList.add("hidden");
+}
+
+const playerState = {
+    seekingInProgress: false,
+    maxSeekPosition: 0,
+    initialSeekDone: false,
+    destroyed: false,
+    lastSeekTime: 0,
+    safetyTimeoutId: null,
+    seekLocked: false,       // 进度条锁定（seek 期间防止 timeupdate 覆盖）
+    seekTargetTime: 0,       // 锁定的目标时间
+    nativeHls: false,        // Safari 原生 HLS（无 MSE/MMS）
+    nativeControls: false,   // 原生控件模式（Safari <17）
+};
+
+const SEEK_DEBOUNCE_MS = 300;
+
+function _resetPlayerState() {
+    playerState.seekingInProgress = false;
+    playerState.initialSeekDone = false;
+    playerState.destroyed = false;
+    playerState.lastSeekTime = 0;
+    playerState.seekLocked = false;
+    playerState.nativeHls = false;
+    playerState.nativeControls = false;
+    if (playerState.safetyTimeoutId) {
+        clearTimeout(playerState.safetyTimeoutId);
+        playerState.safetyTimeoutId = null;
+    }
+}
+
+// ---------- Unified Seek ----------
+
+async function _seekTo(targetTime) {
+    if (!currentVideo || playerState.seekingInProgress || !playerState.initialSeekDone) return;
+    if (playerState.nativeControls) return; // 原生播放器处理 seek
+
+    const video = document.getElementById("video-player");
+
+    // 1. 已缓冲 → 直接跳
+    const buf = video.buffered;
+    for (let i = 0; i < buf.length; i++) {
+        if (targetTime >= buf.start(i) && targetTime <= buf.end(i)) {
+            _lockSeek(targetTime);
+            video.currentTime = targetTime;
+            _unlockOnSeeked(video, targetTime);
+            return;
+        }
+    }
+
+    // 2. 已转码 → HLS.js 自动拉分片
+    if (targetTime < playerState.maxSeekPosition) {
+        _lockSeek(targetTime);
+        video.currentTime = targetTime;
+        _unlockOnSeeked(video, targetTime);
+        return;
+    }
+
+    // 3. 未转码 → 转码 + 等待 + 播放
+    playerState.seekingInProgress = true;
+    showLoading("正在从新位置加载...");
+
+    const quality = currentQuality || currentVideo.recommended_quality;
+    const videoId = currentVideo.id;
+
+    try {
+        const res = await fetch(`/api/video/${encodeURIComponent(videoId)}/seek/${quality}`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({position: targetTime}),
+        });
+        const data = await res.json();
+        if (!data.ok) { _seekFailed("跳转失败"); return; }
+
+        let ready = false;
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 300));
+            if (playerState.destroyed || currentVideo?.id !== videoId) return;
+            try {
+                const checkRes = await fetch(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}/segments-ready?seek=${targetTime}`);
+                if ((await checkRes.json()).ready) { ready = true; break; }
+            } catch (_) {}
+        }
+
+        if (!ready || playerState.destroyed || currentVideo?.id !== videoId) {
+            _seekFailed("加载超时"); return;
+        }
+
+        playerState.maxSeekPosition = Math.max(playerState.maxSeekPosition, targetTime);
+        _reloadHlsAtPosition(videoId, quality, targetTime);
+    } catch (e) {
+        console.error("Seek error:", e);
+        _seekFailed("跳转出错");
+    }
+}
+
+function _lockSeek(targetTime) {
+    playerState.seekLocked = true;
+    playerState.seekTargetTime = targetTime;
+}
+
+function _unlockOnSeeked(video, targetTime) {
+    const onSeeked = () => {
+        video.removeEventListener("seeked", onSeeked);
+        // 视频已跳转到目标位置附近，解锁
+        if (Math.abs(video.currentTime - targetTime) < 2) {
+            playerState.seekLocked = false;
+        }
+    };
+    video.addEventListener("seeked", onSeeked);
+    // 安全超时：防止 seeked 事件不触发时永久锁定
+    setTimeout(() => {
+        playerState.seekLocked = false;
+    }, 3000);
+}
+
+function _seekFailed(msg) {
+    document.getElementById("status").textContent = msg;
+    playerState.seekingInProgress = false;
+    hideLoading();
+}
+
+// ---------- HLS Instance Factory ----------
+
+function _createHlsInstance(videoId, quality, options) {
+    const video = document.getElementById("video-player");
+    const {
+        url,
+        onFirstFragment,
+        onSeekError,
+        driftTargetTime,
+        safetyTimeoutMs = 0,
+    } = options;
+
+    if (hls) { hls.destroy(); hls = null; }
+
+    hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 120,
+        startFragPrefetch: true,
+        enableWorker: true,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 1000,
+    });
+
+    let initialized = false;
+    let mediaErrorRetries = 0;
+    const MAX_MEDIA_ERROR_RETRIES = 3;
+
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        if (playerState.destroyed || currentVideo?.id !== videoId) return;
+        if (!initialized) {
+            initialized = true;
+            playerState.initialSeekDone = true;
+            if (onFirstFragment) onFirstFragment(video);
+        } else if (driftTargetTime !== undefined) {
+            const diff = Math.abs(video.currentTime - driftTargetTime);
+            if (diff > 1) {
+                video.currentTime = driftTargetTime;
+            }
+        }
+        const buf = video.buffered;
+        for (let i = 0; i < buf.length; i++) {
+            if (buf.end(i) > playerState.maxSeekPosition) {
+                playerState.maxSeekPosition = buf.end(i);
+            }
+        }
+    });
+
+    hls.on(Hls.Events.ERROR, (_, data) => {
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            if (mediaErrorRetries < MAX_MEDIA_ERROR_RETRIES) {
+                mediaErrorRetries++;
+                console.warn(`HLS media error (attempt ${mediaErrorRetries}/${MAX_MEDIA_ERROR_RETRIES})`);
+                hls.recoverMediaError();
+            } else {
+                console.error("HLS media error: max retries exceeded");
+                document.getElementById("status").textContent = "流媒体错误";
+                if (onSeekError) onSeekError();
+            }
+        } else {
+            console.error("HLS fatal error:", data);
+            document.getElementById("status").textContent = "流媒体错误";
+            if (onSeekError) onSeekError();
+        }
+    });
+
+    hls.attachMedia(video);
+    hls.loadSource(url);
+
+    if (safetyTimeoutMs > 0) {
+        playerState.safetyTimeoutId = setTimeout(() => {
+            playerState.safetyTimeoutId = null;
+            if (playerState.seekingInProgress && currentVideo?.id === videoId && !initialized) {
+                playerState.seekingInProgress = false;
+                hideLoading();
+                video.onseeking = () => handleVideoSeek(video, quality);
+            }
+        }, safetyTimeoutMs);
+    }
+}
+
+// ---------- HLS Reload at Seek Position ----------
+
+function _reloadHlsAtPosition(videoId, quality, targetTime) {
+    const video = document.getElementById("video-player");
+    video.onseeking = null;
+    video.pause();
+    showLoading();
+
+    // hls.js 路径
+    let seekInited = false;
+    let seekRetryCount = 0;
+    const MAX_SEEK_RETRIES = 10;
+
+    function trySetCurrentTime() {
+        if (playerState.destroyed) return;
+
+        const sr = video.seekable;
+        let canSeek = false;
+        for (let k = 0; k < sr.length; k++) {
+            if (targetTime >= sr.start(k) && targetTime <= sr.end(k)) {
+                canSeek = true;
+                break;
+            }
+        }
+
+        if (canSeek || seekRetryCount >= MAX_SEEK_RETRIES) {
+            video.currentTime = targetTime;
+            video.onseeking = () => handleVideoSeek(video, quality);
+            playerState.seekingInProgress = false;
+            playerState.seekLocked = false;
+            hideLoading();
+            video.play().catch(() => {});
+        } else {
+            seekRetryCount++;
+            setTimeout(trySetCurrentTime, 100);
+        }
+    }
+
+    _createHlsInstance(videoId, quality, {
+        url: `/api/video/${encodeURIComponent(videoId)}/stream/${quality}?start=${targetTime}`,
+        onFirstFragment: () => {
+            seekInited = true;
+            trySetCurrentTime();
+        },
+        onSeekError: () => {
+            playerState.seekingInProgress = false;
+            hideLoading();
+        },
+        driftTargetTime: targetTime,
+        safetyTimeoutMs: 15000,
+    });
+
+    if (_loadedMetadataHandler) {
+        video.removeEventListener("loadedmetadata", _loadedMetadataHandler);
+        _loadedMetadataHandler = null;
+    }
+    _loadedMetadataHandler = () => {
+        if (playerState.destroyed) return;
+        if (!seekInited) {
+            video.currentTime = targetTime;
+        }
+    };
+    video.addEventListener("loadedmetadata", _loadedMetadataHandler, { once: true });
+}
+
+// ---------- Switch Quality ----------
 
 function switchQuality(quality) {
     if (!currentVideo) return;
     currentQuality = quality;
 
     const video = document.getElementById("video-player");
-    const url = `/api/video/${encodeURIComponent(currentVideo.id)}/stream/${quality}`;
-
-    if (hls) {
-        hls.destroy();
-        hls = null;
-    }
+    const videoId = currentVideo.id;
+    const url = `/api/video/${encodeURIComponent(videoId)}/stream/${quality}`;
 
     video.muted = true;
-    _initialSeekDone = false;
-    _seekingInProgress = false;
-    _maxBufferedEnd = 0;
-    _lastSeekTime = 0;
-    _pendingSeekTime = null;
-    _destroyed = false;
+    _resetPlayerState();
+    playerState.maxSeekPosition = 0;
+    hideLoading();
+
+    // 原生控件模式：直接设置 src，保留播放位置
+    if (playerState.nativeControls) {
+        const currentTime = video.currentTime;
+        const wasPlaying = !video.paused;
+        video.src = url;
+        const onMeta = () => {
+            video.removeEventListener("loadedmetadata", onMeta);
+            video.currentTime = currentTime;
+            if (wasPlaying) video.play().catch(() => {});
+            playerState.initialSeekDone = true;
+        };
+        video.addEventListener("loadedmetadata", onMeta, { once: true });
+        return;
+    }
 
     if (Hls.isSupported()) {
-        hls = new Hls({
-            maxBufferLength: 30,
-            maxMaxBufferLength: 120,
-            startFragPrefetch: true,
-            enableWorker: true,
-            fragLoadingMaxRetry: 6,
-            fragLoadingRetryDelay: 1000,
+        _createHlsInstance(videoId, quality, {
+            url: url,
+            onFirstFragment: (v) => {
+                v.currentTime = 0;
+                v.play().catch(() => {});
+            },
         });
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        let inited = false;
-        hls.on(Hls.Events.FRAG_BUFFERED, () => {
-            if (_pendingSeekTime !== null) {
-                // 检查缓冲是否已覆盖 seek 目标位置
-                const buf = video.buffered;
-                let covered = false;
-                for (let i = 0; i < buf.length; i++) {
-                    if (_pendingSeekTime >= buf.start(i) && _pendingSeekTime <= buf.end(i)) {
-                        covered = true;
-                        break;
-                    }
-                }
-                if (covered) {
-                    // 缓冲已覆盖，执行跳转并恢复 seeking 监听
-                    video.currentTime = _pendingSeekTime;
-                    _pendingSeekTime = null;
-                    _initialSeekDone = true;
-                    video.onseeking = () => handleVideoSeek(video, quality);
-                    video.play().catch(() => {});
-                }
-                // 未覆盖时等待下一个 FRAG_BUFFERED 事件
-                return;
-            }
-            if (!inited) {
-                inited = true;
-                _initialSeekDone = true;
-                video.currentTime = 0;
-                video.play().catch(() => {});
-            }
-            const buf = video.buffered;
-            _maxBufferedEnd = 0;
-            for (let i = 0; i < buf.length; i++) {
-                if (buf.end(i) > _maxBufferedEnd) _maxBufferedEnd = buf.end(i);
-            }
-        });
-        hls.on(Hls.Events.ERROR, (_, data) => {
-            if (data.fatal) {
-                console.error("HLS fatal error:", data);
-                document.getElementById("status").textContent = "流媒体错误，请刷新页面";
-            }
-        });
-
         video.onseeking = () => handleVideoSeek(video, quality);
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        playerState.nativeHls = true;
+        video.src = url;
+        const onMeta = () => {
+            video.currentTime = 0;
+            video.play().catch(() => {});
+            playerState.initialSeekDone = true;
+            video.onseeking = () => handleVideoSeek(video, quality);
+        };
+        video.addEventListener("loadedmetadata", onMeta, { once: true });
     } else {
         document.getElementById("status").textContent = "当前浏览器不支持 HLS";
     }
 }
 
-async function handleVideoSeek(video, quality) {
-    if (_seekingInProgress) return;
-    if (!_initialSeekDone) return;
+// ---------- Handle Video Seek ----------
 
-    // 防抖：过滤 hls.js gap-controller 等内部 seek 事件
+function handleVideoSeek(video, quality) {
+    if (playerState.nativeControls) return;
+    if (playerState.seekingInProgress || !playerState.initialSeekDone) return;
     const now = Date.now();
-    if (now - _lastSeekTime < SEEK_DEBOUNCE_MS) return;
-    _lastSeekTime = now;
-
-    const seekTime = video.currentTime;
-    const buf = video.buffered;
-
-    // 重新计算当前缓冲末端（Safari 会主动回收已缓冲区间）
-    _maxBufferedEnd = 0;
-    for (let i = 0; i < buf.length; i++) {
-        if (buf.end(i) > _maxBufferedEnd) _maxBufferedEnd = buf.end(i);
-    }
-
-    // 在已缓冲范围内，不需要断点缓存
-    for (let i = 0; i < buf.length; i++) {
-        if (seekTime >= buf.start(i) && seekTime <= buf.end(i)) return;
-    }
-    if (seekTime < _maxBufferedEnd) return;
-
-    // 拖拽到未缓冲位置，触发断点缓存
-    _seekingInProgress = true;
-    const videoId = currentVideo.id;
-    const statusEl = document.getElementById("status");
-
-    try {
-        statusEl.textContent = "正在从新位置加载...";
-
-        // 启动 seek 转码（会自动停止之前的 seek 转码）
-        const res = await fetch(`/api/video/${encodeURIComponent(videoId)}/seek/${quality}`, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({position: seekTime}),
-        });
-        const data = await res.json();
-        if (!data.ok) {
-            statusEl.textContent = "跳转失败";
-            _seekingInProgress = false;
-            return;
-        }
-
-        // 等待目标位置分片就绪
-        let ready = false;
-        for (let i = 0; i < 30; i++) {
-            await new Promise(r => setTimeout(r, 500));
-            if (_destroyed || currentVideo?.id !== videoId) break;
-            try {
-                const checkRes = await fetch(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}/segments-ready?seek=${seekTime}`);
-                const checkData = await checkRes.json();
-                if (checkData.ready) { ready = true; break; }
-            } catch (_) {}
-        }
-
-        if (ready && !_destroyed && currentVideo?.id === videoId) {
-            // 销毁旧实例，创建新实例，先设置 currentTime 再加载源
-            // 避免 loadSource() 重置播放位置到 0
-            video.onseeking = null;
-            if (hls) { hls.destroy(); hls = null; }
-            video.currentTime = seekTime;
-            hls = new Hls({
-                maxBufferLength: 30,
-                maxMaxBufferLength: 120,
-                startFragPrefetch: true,
-                enableWorker: true,
-                fragLoadingMaxRetry: 6,
-                fragLoadingRetryDelay: 1000,
-            });
-            let seekInited = false;
-            hls.on(Hls.Events.FRAG_BUFFERED, () => {
-                if (!seekInited) {
-                    seekInited = true;
-                    _pendingSeekTime = null;
-                    _initialSeekDone = true;
-                    video.onseeking = () => handleVideoSeek(video, quality);
-                    video.play().catch(() => {});
-                }
-            });
-            hls.on(Hls.Events.ERROR, (_, data) => {
-                if (data.fatal) {
-                    console.error("HLS fatal error:", data);
-                    document.getElementById("status").textContent = "流媒体错误，请刷新页面";
-                }
-            });
-            hls.attachMedia(video);
-            hls.loadSource(`/api/video/${encodeURIComponent(videoId)}/stream/${quality}?start=${seekTime}`);
-            statusEl.textContent = "";
-        } else if (!ready) {
-            statusEl.textContent = "加载超时，请重试";
-        }
-    } catch (e) {
-        console.error("Seek error:", e);
-        statusEl.textContent = "跳转出错";
-    } finally {
-        _seekingInProgress = false;
-    }
+    if (now - playerState.lastSeekTime < SEEK_DEBOUNCE_MS) return;
+    playerState.lastSeekTime = now;
+    _seekTo(video.currentTime);
 }
 
-// ---------- Time Display ----------
+// ---------- Progress Bar & Custom Controls ----------
 
 let _timeUpdateHandler = null;
 
+function _updateProgressBar() {
+    const video = document.getElementById("video-player");
+    const duration = currentVideo?.duration || video.duration || 0;
+    if (!duration) return;
+
+    // seek 锁定期间，进度条保持在目标位置不动
+    if (playerState.seekLocked) {
+        const targetPct = (playerState.seekTargetTime / duration) * 100;
+        document.getElementById("progress-played").style.width = targetPct + "%";
+        document.getElementById("progress-handle").style.left = targetPct + "%";
+        document.getElementById("ctrl-time").textContent =
+            formatDuration(playerState.seekTargetTime) + " / " + formatDuration(duration);
+        // 仍更新缓冲和转码进度条
+        _updateBufferedBars(video, duration);
+        return;
+    }
+
+    const current = video.currentTime;
+    const pct = (current / duration) * 100;
+
+    document.getElementById("progress-played").style.width = pct + "%";
+    document.getElementById("progress-handle").style.left = pct + "%";
+    document.getElementById("ctrl-time").textContent =
+        formatDuration(current) + " / " + formatDuration(duration);
+
+    _updateBufferedBars(video, duration);
+}
+
+function _updateBufferedBars(video, duration) {
+    const buf = video.buffered;
+    let maxBuf = 0;
+    for (let i = 0; i < buf.length; i++) {
+        if (buf.end(i) > maxBuf) maxBuf = buf.end(i);
+    }
+    document.getElementById("progress-buffered").style.width = (maxBuf / duration) * 100 + "%";
+    const transcodedEnd = Math.max(maxBuf, playerState.maxSeekPosition);
+    document.getElementById("progress-transcoded").style.width = (transcodedEnd / duration) * 100 + "%";
+}
+
 function setupTimeDisplay() {
     const video = document.getElementById("video-player");
-    const curEl = document.getElementById("player-current-time");
-    const totalEl = document.getElementById("player-total-time");
 
-    // 清除旧的事件监听
     if (_timeUpdateHandler) {
         video.removeEventListener("timeupdate", _timeUpdateHandler);
     }
 
-    _timeUpdateHandler = () => {
-        curEl.textContent = formatDuration(video.currentTime);
-        // duration 可能是 Infinity (直播流) 或 NaN
-        if (video.duration && isFinite(video.duration) && video.duration > 0) {
-            totalEl.textContent = formatDuration(video.duration);
-        } else if (currentVideo) {
-            totalEl.textContent = formatDuration(currentVideo.duration);
-        }
-    };
+    _timeUpdateHandler = () => _updateProgressBar();
     video.addEventListener("timeupdate", _timeUpdateHandler);
 
-    // 初始化显示
-    curEl.textContent = "0:00";
-    totalEl.textContent = currentVideo ? formatDuration(currentVideo.duration) : "0:00";
+    _updateProgressBar();
+}
+
+function togglePlayPause() {
+    const video = document.getElementById("video-player");
+    if (!currentVideo) return;
+    if (video.paused) {
+        video.play().catch(() => {});
+    } else {
+        video.pause();
+    }
+}
+
+function _updatePlayPauseIcon() {
+    const video = document.getElementById("video-player");
+    const playIcon = document.getElementById("icon-play");
+    const pauseIcon = document.getElementById("icon-pause");
+    if (!video || !playIcon || !pauseIcon) return;
+    if (video.paused) {
+        playIcon.style.display = "";
+        pauseIcon.style.display = "none";
+    } else {
+        playIcon.style.display = "none";
+        pauseIcon.style.display = "";
+    }
+}
+
+function _onVideoClick(e) {
+    if (!currentVideo) return;
+    // 如果点击的是控件区域，不处理
+    if (e.target.closest(".custom-controls")) return;
+    togglePlayPause();
+}
+
+function _onProgressClick(e) {
+    if (!currentVideo) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    _seekTo(ratio * (currentVideo.duration || 0));
+}
+
+function _onProgressTouchStart(e) {
+    if (!currentVideo) return;
+    e.preventDefault();
+    const touch = e.touches[0];
+    _progressDrag(touch);
+}
+
+function _onProgressTouchMove(e) {
+    if (!currentVideo) return;
+    e.preventDefault();
+    _progressDrag(e.touches[0]);
+}
+
+function _onProgressTouchEnd(e) {
+    if (!currentVideo) return;
+    e.preventDefault();
+    const touch = e.changedTouches[0];
+    const container = document.getElementById("progress-container");
+    const rect = container.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+    _seekTo(ratio * (currentVideo.duration || 0));
+}
+
+function _progressDrag(touch) {
+    const container = document.getElementById("progress-container");
+    const rect = container.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+    const duration = currentVideo.duration || 0;
+    const pct = ratio * 100;
+    document.getElementById("progress-played").style.width = pct + "%";
+    document.getElementById("progress-handle").style.left = pct + "%";
+    document.getElementById("ctrl-time").textContent =
+        formatDuration(ratio * duration) + " / " + formatDuration(duration);
+}
+
+function toggleFullscreen() {
+    const wrapper = document.querySelector(".player-wrapper");
+    if (!wrapper) return;
+    if (document.fullscreenElement) {
+        document.exitFullscreen();
+    } else {
+        wrapper.requestFullscreen().catch(() => {});
+    }
+}
+
+function _onKeydown(e) {
+    if (!currentVideo) return;
+    const video = document.getElementById("video-player");
+    switch (e.key) {
+        case " ":
+        case "k":
+            e.preventDefault();
+            togglePlayPause();
+            break;
+        case "ArrowLeft":
+            e.preventDefault();
+            video.currentTime = Math.max(0, video.currentTime - 5);
+            break;
+        case "ArrowRight":
+            e.preventDefault();
+            video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+            break;
+        case "f":
+            e.preventDefault();
+            toggleFullscreen();
+            break;
+    }
 }
 
 // ---------- Clear Video Cache ----------
@@ -837,7 +1273,7 @@ async function clearCurrentVideoCache() {
 }
 
 function goBack() {
-    _destroyed = true;
+    playerState.destroyed = true;
     if (hls) {
         hls.destroy();
         hls = null;
@@ -845,17 +1281,27 @@ function goBack() {
     const video = document.getElementById("video-player");
     video.pause();
     video.removeAttribute("src");
+    video.controls = false;
+    video.onseeking = null;
+    document.querySelector(".player-wrapper")?.classList.remove("native-controls-mode");
+
+    // 批量移除事件监听
+    for (const [el, evt, fn] of _playerListeners) {
+        el.removeEventListener(evt, fn);
+    }
+    _playerListeners.length = 0;
+    if (_loadedMetadataHandler) {
+        video.removeEventListener("loadedmetadata", _loadedMetadataHandler);
+        _loadedMetadataHandler = null;
+    }
     if (_timeUpdateHandler) {
         video.removeEventListener("timeupdate", _timeUpdateHandler);
         _timeUpdateHandler = null;
     }
 
-    _seekingInProgress = false;
-    _maxBufferedEnd = 0;
-    _initialSeekDone = false;
-    _lastSeekTime = 0;
-    _pendingSeekTime = null;
-    _destroyed = false;
+    _resetPlayerState();
+    playerState.maxSeekPosition = 0;
+    hideLoading();
 
     document.getElementById("player-section").classList.add("hidden");
     document.getElementById("library").classList.remove("hidden");
@@ -863,7 +1309,10 @@ function goBack() {
     document.getElementById("pagination").classList.remove("hidden");
     document.getElementById("status").textContent = "";
     currentVideo = null;
+    currentQuality = null;
 
+    // 恢复预转码
+    fetch("/api/pretranscode/resume", { method: "POST" }).catch(() => {});
     checkDiskStatus();
 }
 

@@ -6,7 +6,7 @@
     <title>视频库 - 视频流媒体服务器</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+    <script src="/static/hls.min.js"></script>
 </head>
 <body>
     <header>
@@ -35,9 +35,10 @@
         </div>
         <div class="settings-body">
             <div class="form-group">
-                <label for="input-video-dir">视频目录</label>
-                <input type="text" id="input-video-dir" placeholder="/path/to/videos">
-                <span class="hint">视频文件所在的本地路径</span>
+                <label>视频目录</label>
+                <div id="video-dirs-list"></div>
+                <button class="add-dir-btn" onclick="addVideoDir()">+ 添加目录</button>
+                <span class="hint">视频文件所在的本地路径，支持多个目录</span>
             </div>
             <div class="form-group">
                 <label for="input-cache-dir">缓存目录</label>
@@ -71,6 +72,7 @@
                 </div>
                 <button id="cache-init-btn" class="cache-btn" onclick="startBatchCache()">一键缓存全部</button>
                 <button id="cache-stop-btn" class="cache-btn cache-btn-stop hidden" onclick="stopBatchCache()">停止缓存</button>
+                <button id="cache-clear-all-btn" class="cache-btn cache-btn-stop" onclick="clearAllCache()">一键清除全部</button>
                 <div class="sort-group">
                     <label>每页:</label>
                     <select id="perpage-select" onchange="changePerPage(this.value)">
@@ -101,6 +103,9 @@
         <!-- 磁盘空间提示 -->
         <div id="disk-warning" class="disk-warning hidden"></div>
 
+        <!-- 预转码状态 -->
+        <div id="pretranscode-status" class="pretranscode-status hidden"></div>
+
         <!-- 视频库 -->
         <section id="library" class="active">
             <div id="video-grid"></div>
@@ -114,12 +119,25 @@
         <section id="player-section" class="hidden">
             <button id="back-btn" onclick="goBack()">&#8592; 返回</button>
             <div class="player-wrapper">
-                <video id="video-player" controls></video>
-            </div>
-            <div id="player-time-bar">
-                <span id="player-current-time">0:00</span>
-                <span id="player-separator">/</span>
-                <span id="player-total-time">0:00</span>
+                <video id="video-player" playsinline></video>
+                <div class="custom-controls">
+                    <button id="play-pause-btn" class="ctrl-btn" onclick="togglePlayPause()">
+                        <svg id="icon-play" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+                        <svg id="icon-pause" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="5" y="3" width="4" height="18"/><rect x="15" y="3" width="4" height="18"/></svg>
+                    </button>
+                    <div class="progress-container" id="progress-container">
+                        <div class="progress-track">
+                            <div class="progress-transcoded" id="progress-transcoded"></div>
+                            <div class="progress-buffered" id="progress-buffered"></div>
+                            <div class="progress-played" id="progress-played"></div>
+                            <div class="progress-handle" id="progress-handle"></div>
+                        </div>
+                    </div>
+                    <span class="ctrl-time" id="ctrl-time">0:00 / 0:00</span>
+                    <button id="fullscreen-btn" class="ctrl-btn" onclick="toggleFullscreen()">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"/></svg>
+                    </button>
+                </div>
             </div>
             <div id="video-info"></div>
             <div class="player-controls">

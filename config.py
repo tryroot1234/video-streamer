@@ -21,7 +21,7 @@ PORT = int(os.getenv("PORT", "8000"))
 
 # 可动态修改的设置
 _settings: dict = {
-    "video_dir": os.getenv("VIDEO_DIR", str(Path.home() / "Videos")),
+    "video_dirs": [],
     "cache_dir": str(BASE_DIR / "cache"),
     "max_cache_size_gb": 50,
 }
@@ -32,6 +32,9 @@ def load_settings():
     if SETTINGS_FILE.exists():
         try:
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            # 向后兼容：旧的 video_dir 字符串 → video_dirs 列表
+            if "video_dir" in saved and "video_dirs" not in saved:
+                saved["video_dirs"] = [saved.pop("video_dir")]
             _settings.update(saved)
         except Exception:
             pass
@@ -53,7 +56,7 @@ def get_all() -> dict:
 
 def update(data: dict) -> dict:
     global _settings
-    allowed = {"video_dir", "cache_dir", "max_cache_size_gb"}
+    allowed = {"video_dirs", "cache_dir", "max_cache_size_gb"}
     for k, v in data.items():
         if k in allowed and v is not None:
             _settings[k] = v
