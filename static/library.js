@@ -112,7 +112,7 @@ const _i18n = {
 let _lang = localStorage.getItem("lang") || "zh";
 
 function t(key) {
-    return _i18n[_lang]?.[key] || _i18n.zh[key] || key;
+    return _i18n[_lang]?.[key] ?? _i18n.zh[key] ?? key;
 }
 
 function _applyLang() {
