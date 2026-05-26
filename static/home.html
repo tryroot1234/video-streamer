@@ -3,32 +3,72 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>视频流媒体服务器</title>
+    <title data-i18n="pageTitle">视频流媒体服务器</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <div class="home-container">
         <div class="home-card">
-            <h1>视频流媒体服务器</h1>
-            <p class="subtitle">自托管视频流媒体，支持实时转码与硬件加速</p>
+            <div class="home-header-row">
+                <h1 data-i18n="title">视频流媒体服务器</h1>
+                <button id="lang-btn" class="lang-btn" onclick="toggleLang()">EN</button>
+            </div>
+            <p class="subtitle" data-i18n="subtitle">自托管视频流媒体，支持实时转码与硬件加速</p>
 
             <div class="url-section">
-                <label>访问地址</label>
+                <label data-i18n="accessUrl">访问地址</label>
                 <div class="url-row">
                     <input type="text" id="access-url" readonly>
-                    <button id="copy-btn" onclick="copyUrl()" title="复制">
+                    <button id="copy-btn" onclick="copyUrl()" title="Copy">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
                     </button>
                 </div>
                 <span id="copy-msg" class="copy-msg"></span>
             </div>
 
-            <a href="/library" class="enter-btn">进入视频库</a>
+            <a href="/library" class="enter-btn" data-i18n="enter">进入视频库</a>
         </div>
     </div>
 
     <script>
+        const _i18n = {
+            zh: {
+                pageTitle: "视频流媒体服务器",
+                title: "视频流媒体服务器",
+                subtitle: "自托管视频流媒体，支持实时转码与硬件加速",
+                accessUrl: "访问地址",
+                enter: "进入视频库",
+                copied: "已复制!",
+            },
+            en: {
+                pageTitle: "Video Streamer",
+                title: "Video Streamer",
+                subtitle: "Self-hosted video streaming with real-time transcoding & hardware acceleration",
+                accessUrl: "Access URL",
+                enter: "Enter Video Library",
+                copied: "Copied!",
+            },
+        };
+
+        let _lang = localStorage.getItem("lang") || "zh";
+
+        function t(key) { return _i18n[_lang]?.[key] || _i18n.zh[key] || key; }
+
+        function _applyLang() {
+            document.documentElement.lang = _lang === "zh" ? "zh-CN" : "en";
+            document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+            document.getElementById("lang-btn").textContent = _lang === "zh" ? "EN" : "中文";
+        }
+
+        function toggleLang() {
+            _lang = _lang === "zh" ? "en" : "zh";
+            localStorage.setItem("lang", _lang);
+            _applyLang();
+        }
+
+        _applyLang();
+
         const url = window.location.origin;
         document.getElementById("access-url").value = url;
 
@@ -36,14 +76,14 @@
             try {
                 await navigator.clipboard.writeText(url);
                 const msg = document.getElementById("copy-msg");
-                msg.textContent = "已复制!";
+                msg.textContent = t("copied");
                 setTimeout(() => msg.textContent = "", 2000);
             } catch {
                 const input = document.getElementById("access-url");
                 input.select();
                 document.execCommand("copy");
                 const msg = document.getElementById("copy-msg");
-                msg.textContent = "已复制!";
+                msg.textContent = t("copied");
                 setTimeout(() => msg.textContent = "", 2000);
             }
         }

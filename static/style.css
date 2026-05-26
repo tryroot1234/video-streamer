@@ -753,10 +753,18 @@ main {
     box-shadow: 0 8px 32px rgba(0,0,0,0.3);
 }
 
+.home-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
 .home-card h1 {
     font-size: 28px;
     font-weight: 700;
-    margin-bottom: 8px;
+    margin-bottom: 0;
 }
 
 .home-card .subtitle {
