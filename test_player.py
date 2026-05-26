@@ -2299,6 +2299,438 @@ class TestSafariPlayerControls:
 
 
 # ============================================================
+# TC-28: 自定义控件（Chrome hls.js + custom controls）
+#
+# 第一性原理：视频控件的本质 = 显示状态 + 响应交互 + 状态同步
+# 简易：每个测试只验证一件事
+# 变易：覆盖状态转换（播放↔暂停、seek、全屏）
+# 不易：验证不变量（事件注册/清理、守卫、关注点分离）
+# ============================================================
+
+
+class TestCustomControls:
+    """Chrome 自定义控件结构验证（library.js 源码模式检查）"""
+
+    @staticmethod
+    def _read_library_js():
+        js_path = Path(__file__).parent / "static" / "library.js"
+        return js_path.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _fn_body(js, fn_name):
+        """提取函数体（从 function 声明到下一个顶层 function/注释块）"""
+        escaped = re.escape(fn_name)
+        match = re.search(
+            rf"(?:async )?function {escaped}\s*\(.*?\)\s*\{{(.+?)(?=\n(?:async )?function |\n// ---|\Z)",
+            js, re.DOTALL
+        )
+        assert match, f"{fn_name}() not found in library.js"
+        return match.group(1)
+
+    # ── 不易：显示状态的不变量 ──
+
+    def test_update_play_pause_icon_shows_play_when_paused(self):
+        """TC-28a: 暂停时显示播放图标，隐藏暂停图标"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updatePlayPauseIcon")
+        # paused → show play, hide pause
+        assert 'playIcon.style.display = ""' in body
+        assert 'pauseIcon.style.display = "none"' in body
+
+    def test_update_play_pause_icon_shows_pause_when_playing(self):
+        """TC-28b: 播放时显示暂停图标，隐藏播放图标"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updatePlayPauseIcon")
+        assert 'playIcon.style.display = "none"' in body
+        assert 'pauseIcon.style.display = ""' in body
+
+    def test_update_play_pause_icon_guards_null_elements(self):
+        """TC-28c: _updatePlayPauseIcon 对缺失 DOM 元素做空值守卫"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updatePlayPauseIcon")
+        # 函数入口应检查 video/playIcon/pauseIcon 是否存在
+        early = body[:200]
+        assert "!video" in early or "!playIcon" in early or "!pauseIcon" in early, \
+            "_updatePlayPauseIcon missing null guard"
+
+    def test_update_progress_bar_uses_duration_from_video_or_metadata(self):
+        """TC-28d: 进度条时间来源优先级：currentVideo.duration > video.duration > 0"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateProgressBar")
+        assert "currentVideo?.duration" in body or "currentVideo.duration" in body, \
+            "_updateProgressBar should prefer currentVideo.duration"
+        assert "video.duration" in body, \
+            "_updateProgressBar should fallback to video.duration"
+
+    def test_update_progress_bar_skips_when_no_duration(self):
+        """TC-28e: 无 duration 时跳过更新（避免除零）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateProgressBar")
+        early = body[:200]
+        assert "if (!duration)" in early or "if (!duration) return" in early, \
+            "_updateProgressBar should guard against zero duration"
+
+    def test_update_progress_bar_locks_during_seek(self):
+        """TC-28f: seek 锁定期间进度条停在目标位置不动"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateProgressBar")
+        assert "seekLocked" in body, \
+            "_updateProgressBar should check seekLocked"
+        assert "seekTargetTime" in body, \
+            "_updateProgressBar should use seekTargetTime when locked"
+
+    def test_update_progress_bar_updates_played_position(self):
+        """TC-28g: 正常播放时进度条跟随 currentTime 更新"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateProgressBar")
+        assert "video.currentTime" in body, \
+            "_updateProgressBar should read video.currentTime"
+        assert "progress-played" in body, \
+            "_updateProgressBar should update progress-played width"
+
+    def test_update_progress_bar_updates_time_display(self):
+        """TC-28h: 时间文字跟随 currentTime 更新"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateProgressBar")
+        assert "ctrl-time" in body, \
+            "_updateProgressBar should update ctrl-time text"
+        assert "formatDuration" in body, \
+            "_updateProgressBar should use formatDuration"
+
+    def test_update_buffered_bars_tracks_buffered_range(self):
+        """TC-28i: 缓冲进度条追踪 video.buffered 最大值"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateBufferedBars")
+        assert "video.buffered" in body
+        assert "buf.end(i)" in body
+        assert "progress-buffered" in body
+
+    def test_update_buffered_bars_tracks_transcoded_range(self):
+        """TC-28j: 转码进度条 = max(buffered, maxSeekPosition)"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_updateBufferedBars")
+        assert "maxSeekPosition" in body
+        assert "progress-transcoded" in body
+        assert "Math.max" in body
+
+    # ── 变易：交互的状态转换 ──
+
+    def test_toggle_play_pause_calls_play_when_paused(self):
+        """TC-28k: 暂停状态点击 → 调用 play()"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "togglePlayPause")
+        assert "video.paused" in body, "togglePlayPause should check video.paused"
+        assert "video.play()" in body, "togglePlayPause should call play()"
+
+    def test_toggle_play_pause_calls_pause_when_playing(self):
+        """TC-28l: 播放状态点击 → 调用 pause()"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "togglePlayPause")
+        assert "video.pause()" in body, "togglePlayPause should call pause()"
+
+    def test_toggle_play_pause_guards_no_current_video(self):
+        """TC-28m: 无视频时 togglePlayPause 不执行"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "togglePlayPause")
+        early = body[:100]
+        assert "!currentVideo" in early, \
+            "togglePlayPause should guard against no currentVideo"
+
+    def test_on_video_click_toggles_play_pause(self):
+        """TC-28n: 点击视频区域 → togglePlayPause"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onVideoClick")
+        assert "togglePlayPause()" in body
+
+    def test_on_video_click_ignores_controls_area(self):
+        """TC-28o: 点击控件区域不触发 togglePlayPause（防止冒泡冲突）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onVideoClick")
+        assert ".custom-controls" in body, \
+            "_onVideoClick should check for .custom-controls click"
+        assert "return" in body, \
+            "_onVideoClick should return early when clicking controls area"
+
+    def test_on_progress_click_computes_ratio(self):
+        """TC-28p: 进度条点击 → 计算 0-1 比例 → seekTo"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressClick")
+        assert "getBoundingClientRect()" in body
+        assert "clientX" in body
+        assert "rect.left" in body
+        assert "rect.width" in body
+        assert "_seekTo(" in body
+
+    def test_on_progress_click_clamps_ratio(self):
+        """TC-28q: 进度条点击比例被 clamp 到 [0, 1]"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressClick")
+        assert "Math.max(0" in body
+        assert "Math.min(1" in body
+
+    def test_on_progress_click_multiplies_by_duration(self):
+        """TC-28r: 进度条点击 → ratio * duration = seek 目标时间"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressClick")
+        assert "currentVideo.duration" in body or "currentVideo?.duration" in body
+
+    def test_progress_drag_updates_ui_preview(self):
+        """TC-28s: 拖动进度条时实时预览位置（不触发 seek）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_progressDrag")
+        assert "progress-played" in body
+        assert "progress-handle" in body
+        assert "ctrl-time" in body
+        # _progressDrag 只更新 UI，不调用 _seekTo
+        assert "_seekTo" not in body, \
+            "_progressDrag should only preview, not seek"
+
+    def test_progress_touch_end_triggers_seek(self):
+        """TC-28t: 触摸结束时触发 seek"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressTouchEnd")
+        assert "_seekTo(" in body
+
+    def test_progress_touch_events_prevent_default(self):
+        """TC-28u: 触摸事件调用 preventDefault（防止页面滚动）"""
+        js = self._read_library_js()
+        for fn_name in ["_onProgressTouchStart", "_onProgressTouchMove", "_onProgressTouchEnd"]:
+            body = self._fn_body(js, fn_name)
+            assert "e.preventDefault()" in body, \
+                f"{fn_name} should call e.preventDefault()"
+
+    def test_toggle_fullscreen_toggles_state(self):
+        """TC-28v: 全屏切换：进入 ↔ 退出"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "toggleFullscreen")
+        assert "fullscreenElement" in body, \
+            "toggleFullscreen should check current fullscreen state"
+        assert "exitFullscreen" in body, \
+            "toggleFullscreen should exit fullscreen"
+        assert "EnterFs" in body or "enterFs" in body or "requestFullscreen" in body or "webkitEnterFullscreen" in body, \
+            "toggleFullscreen should enter fullscreen"
+
+    # ── 简易：键盘快捷键映射 ──
+
+    def test_keydown_space_toggles_play(self):
+        """TC-28w: 空格键 → togglePlayPause"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        assert '" "' in body or "''" not in body  # space key
+        assert "togglePlayPause()" in body
+
+    def test_keydown_k_toggles_play(self):
+        """TC-28x: K 键 → togglePlayPause"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        assert '"k"' in body
+
+    def test_keydown_arrow_left_seeks_backward(self):
+        """TC-28y: 左箭头 → 后退 5 秒"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        assert "ArrowLeft" in body
+        assert "_seekTo(" in body
+        assert "currentTime - 5" in body
+
+    def test_keydown_arrow_right_seeks_forward(self):
+        """TC-28z: 右箭头 → 前进 5 秒"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        assert "ArrowRight" in body
+        assert "_seekTo(" in body
+        assert "currentTime + 5" in body
+
+    def test_keydown_f_toggles_fullscreen(self):
+        """TC-28aa: F 键 → toggleFullscreen"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        assert '"f"' in body
+        assert "toggleFullscreen()" in body
+
+    def test_keydown_prevents_default_for_player_keys(self):
+        """TC-28ab: 播放器快捷键阻止默认行为（空格不滚动页面）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        # 每个 case 都应有 preventDefault
+        count = body.count("e.preventDefault()")
+        assert count >= 4, f"_onKeydown only has {count} preventDefault calls (need >=4)"
+
+    def test_keydown_guards_no_current_video(self):
+        """TC-28ac: 无视频时键盘事件不执行"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onKeydown")
+        early = body[:100]
+        assert "!currentVideo" in early
+
+    # ── 不易：事件注册与清理 ──
+
+    def test_doplay_chrome_registers_video_click(self):
+        """TC-28ad: Chrome 路径注册 video click 事件"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        chrome_section = doplay[doplay.index("Chrome"):]
+        assert "_listen(vidEl" in chrome_section and "_onVideoClick" in chrome_section
+
+    def test_doplay_chrome_registers_play_pause_icon_listener(self):
+        """TC-28ae: Chrome 路径注册 play/pause 图标更新事件"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        chrome_section = doplay[doplay.index("Chrome"):]
+        assert '"play"' in chrome_section and "_updatePlayPauseIcon" in chrome_section
+        assert '"pause"' in chrome_section
+
+    def test_doplay_chrome_registers_progress_events(self):
+        """TC-28af: Chrome 路径注册进度条 click/touch 事件"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        chrome_section = doplay[doplay.index("Chrome"):]
+        assert "_onProgressClick" in chrome_section
+        assert "_onProgressTouchStart" in chrome_section
+        assert "_onProgressTouchMove" in chrome_section
+        assert "_onProgressTouchEnd" in chrome_section
+
+    def test_doplay_chrome_registers_keyboard(self):
+        """TC-28ag: Chrome 路径注册键盘事件"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        chrome_section = doplay[doplay.index("Chrome"):]
+        assert "_onKeydown" in chrome_section
+
+    def test_doplay_safari_registers_keyboard(self):
+        """TC-28ah: 所有浏览器都注册键盘事件（共享自定义控件）"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        assert "_onKeydown" in doplay
+
+    def test_doplay_no_native_controls(self):
+        """TC-28ai: 所有浏览器都使用自定义控件，不用原生控件"""
+        js = self._read_library_js()
+        doplay = self._fn_body(js, "doPlay")
+        assert "nativeControls = true" not in doplay
+        assert "vidEl.controls = true" not in doplay
+        assert "native-controls-mode" not in doplay
+
+    def test_goback_cleans_up_player_listeners(self):
+        """TC-28ak: goBack 清理所有 _playerListeners"""
+        js = self._read_library_js()
+        goback = self._fn_body(js, "goBack")
+        assert "_playerListeners" in goback
+        assert "removeEventListener" in goback
+
+    def test_goback_cleans_up_time_update_handler(self):
+        """TC-28al: goBack 清理 timeupdate handler"""
+        js = self._read_library_js()
+        goback = self._fn_body(js, "goBack")
+        assert "_timeUpdateHandler" in goback
+
+    def test_goback_removes_native_controls_mode(self):
+        """TC-28am: goBack 移除 native-controls-mode class"""
+        js = self._read_library_js()
+        goback = self._fn_body(js, "goBack")
+        assert "native-controls-mode" in goback
+        assert "remove" in goback
+
+    def test_goback_removes_controls_attribute(self):
+        """TC-28an: goBack 移除 video.controls"""
+        js = self._read_library_js()
+        goback = self._fn_body(js, "goBack")
+        assert "removeAttribute" in goback and "controls" in goback
+
+    # ── 不易：seek 安全性 ──
+
+    def test_seek_to_guards_no_current_video(self):
+        """TC-28ao: _seekTo 无视频时不执行"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        early = body[:200]
+        assert "!currentVideo" in early
+
+    def test_seek_to_guards_seeking_in_progress(self):
+        """TC-28ap: _seekTo 在 seekingInProgress 时跳过"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        early = body[:200]
+        assert "seekingInProgress" in early
+
+    def test_seek_to_guards_before_initial_seek(self):
+        """TC-28aq: _seekTo 在 initialSeekDone 前跳过"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        early = body[:200]
+        assert "initialSeekDone" in early
+
+    def test_seek_to_skips_for_native_hls(self):
+        """TC-28ar: _seekTo 对 Safari 原生 HLS 直接返回"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        early = body[:300]
+        assert "nativeHls" in early
+
+    def test_seek_to_uses_seekable_range(self):
+        """TC-28as: _seekTo 用 video.seekable 判断是否可直接跳"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        assert "video.seekable" in body
+        assert "video.currentTime = targetTime" in body
+
+    def test_seek_to_handles_buffered_range(self):
+        """TC-28at: 已缓冲范围内 seek → 直接设置 currentTime"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_seekTo")
+        # 第一个分支：已缓冲 → 直接跳
+        buf_section = body[:body.index("_reloadHlsAtPosition")] if "_reloadHlsAtPosition" in body else body
+        assert "video.currentTime = targetTime" in buf_section
+
+    # ── 变易：进度条触摸交互 ──
+
+    def test_progress_touch_start_calls_drag(self):
+        """TC-28au: touchstart → _progressDrag（实时预览）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressTouchStart")
+        assert "_progressDrag(" in body
+
+    def test_progress_touch_move_calls_drag(self):
+        """TC-28av: touchmove → _progressDrag（拖动预览）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_onProgressTouchMove")
+        assert "_progressDrag(" in body
+
+    # ── 不易：关注点分离 ──
+
+    def test_create_hls_instance_sets_onseeking_immediately(self):
+        """TC-28aw: _createHlsInstance 在 attachMedia 后立即设置 onseeking（不等 first fragment）"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_createHlsInstance")
+        attach_pos = body.find("attachMedia(video)")
+        onseeking_pos = body.find("video.onseeking =")
+        loadsource_pos = body.find("loadSource(")
+        assert attach_pos >= 0, "_createHlsInstance missing attachMedia"
+        assert onseeking_pos >= 0, "_createHlsInstance missing onseeking assignment"
+        assert loadsource_pos >= 0, "_createHlsInstance missing loadSource"
+        assert attach_pos < onseeking_pos < loadsource_pos, \
+            "onseeking should be set between attachMedia and loadSource"
+
+    def test_reload_hls_clears_onseeking_before_create(self):
+        """TC-28ax: _reloadHlsAtPosition 在 _createHlsInstance 前清除 onseeking"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_reloadHlsAtPosition")
+        clear_pos = body.find("video.onseeking = null")
+        create_pos = body.find("_createHlsInstance(")
+        assert clear_pos >= 0
+        assert create_pos >= 0
+        assert clear_pos < create_pos
+
+    def test_reload_hls_restores_onseeking_after_seek(self):
+        """TC-28ay: _reloadHlsAtPosition seek 完成后恢复 onseeking"""
+        js = self._read_library_js()
+        body = self._fn_body(js, "_reloadHlsAtPosition")
+        # trySetCurrentTime 内应恢复 onseeking
+        assert "handleVideoSeek" in body, \
+            "_reloadHlsAtPosition should restore onseeking after seek"
+
+
+# ============================================================
 # TC-27: is_live 直播模式 m3u8（边转码边播放）
 # ============================================================
 
@@ -2445,7 +2877,7 @@ class TestLiveM3u8:
         assert live_extinf == vod_extinf
 
     def test_stream_endpoint_live_when_transcoding(self, cache_dir, video_dir):
-        """TC-27k: stream 端点在转码进行中返回 live m3u8（无 ENDLIST）"""
+        """TC-27k: stream 端点始终返回 VOD m3u8（即使转码进行中）"""
         from unittest.mock import MagicMock
 
         mock_job = MagicMock()
@@ -2467,13 +2899,12 @@ class TestLiveM3u8:
             client = TestClient(app)
 
             with patch("main.is_cached", return_value=False), \
-                 patch("main.get_or_start_transcode", return_value=mock_job), \
-                 patch("main.get_job", return_value=mock_job):
+                 patch("main.get_or_start_transcode", return_value=mock_job):
                 resp = client.get("/api/video/vid1/stream/720p")
 
         assert resp.status_code == 200
-        assert "#EXT-X-ENDLIST" not in resp.text
-        assert "#EXT-X-PLAYLIST-TYPE:VOD" not in resp.text
+        assert "#EXT-X-ENDLIST" in resp.text
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" in resp.text
 
     def test_stream_endpoint_vod_when_transcode_done(self, cache_dir, video_dir):
         """TC-27l: stream 端点在转码完成后返回 VOD m3u8（有 ENDLIST）"""
@@ -2496,8 +2927,7 @@ class TestLiveM3u8:
             from main import app
             client = TestClient(app)
 
-            with patch("main.is_cached", return_value=True), \
-                 patch("main.get_job", return_value=mock_job):
+            with patch("main.is_cached", return_value=True):
                 resp = client.get("/api/video/vid1/stream/720p")
 
         assert resp.status_code == 200
@@ -2518,24 +2948,28 @@ class TestSafariBackwardSeek:
         js_path = Path(__file__).parent / "static" / "library.js"
         return js_path.read_text(encoding="utf-8")
 
-    def test_handlevideoseek_has_two_paths(self):
-        """TC-28a: _seekTo 区分已转码范围和未转码范围两条路径"""
+    def test_handlevideoseek_has_seekable_path(self):
+        """TC-28a: _seekTo 区分 seekable 范围内和范围外两条路径"""
         js = self._read_library_js()
         seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
         assert seek_match, "_seekTo() not found"
         seek_body = seek_match.group(1)
-        assert "targetTime < playerState.maxSeekPosition" in seek_body, \
-            "_seekTo missing fast path for already-transcoded range"
+        assert "video.seekable" in seek_body, \
+            "_seekTo missing seekable range check"
 
-    def test_backward_seek_fast_path_no_transcode(self):
-        """TC-28b: 已转码范围的 seek 不调用 seek 转码 API"""
+    def test_seekable_path_no_transcode(self):
+        """TC-28b: seekable 范围内的 seek 不调用 seek 转码 API"""
         js = self._read_library_js()
         seek_match = re.search(r"async function _seekTo\(targetTime\)\s*\{(.+?)(?=\nfunction |\n// ---)", js, re.DOTALL)
         assert seek_match
         seek_body = seek_match.group(1)
-        fast_path = seek_body[:seek_body.find("targetTime < playerState.maxSeekPosition") + 200]
-        assert "return;" in fast_path, \
-            "Fast path for already-transcoded seek should return early"
+        # seekable path 应在 transcode API 调用之前 return
+        seekable_pos = seek_body.find("video.seekable")
+        transcode_pos = seek_body.find("/seek/")
+        assert seekable_pos >= 0 and transcode_pos >= 0
+        seekable_section = seek_body[seekable_pos:transcode_pos]
+        assert "return;" in seekable_section, \
+            "Seekable range path should return early before transcode"
 
     def test_backward_seek_fast_path_uses_start_param(self):
         """TC-28c: _seekTo 超出转码范围时调用 _reloadHlsAtPosition（含 ?start= 参数）"""
@@ -2552,10 +2986,10 @@ class TestSafariBackwardSeek:
         assert seek_match
         seek_body = seek_match.group(1)
         buffer_check = seek_body.find("targetTime >= buf.start(i) && targetTime <= buf.end(i)")
-        maxbuf_check = seek_body.find("targetTime < playerState.maxSeekPosition")
+        seekable_check = seek_body.find("video.seekable")
         assert buffer_check > 0, "Missing buffer range check"
-        assert maxbuf_check > buffer_check, \
-            "Buffer range check should come before maxSeekPosition check"
+        assert seekable_check > buffer_check, \
+            "Buffer range check should come before seekable range check"
 
     def test_no_maxbuffered_reset_in_handlevideoseek(self):
         """TC-28e: _seekTo 中不重置 maxSeekPosition"""

@@ -24,6 +24,7 @@ _settings: dict = {
     "video_dirs": [],
     "cache_dir": str(BASE_DIR / "cache"),
     "max_cache_size_gb": 50,
+    "max_concurrent_transcode": 5,
 }
 
 
@@ -56,7 +57,7 @@ def get_all() -> dict:
 
 def update(data: dict) -> dict:
     global _settings
-    allowed = {"video_dirs", "cache_dir", "max_cache_size_gb"}
+    allowed = {"video_dirs", "cache_dir", "max_cache_size_gb", "max_concurrent_transcode"}
     for k, v in data.items():
         if k in allowed and v is not None:
             _settings[k] = v

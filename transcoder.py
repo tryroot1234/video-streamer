@@ -11,6 +11,7 @@ import config
 from config import HLS_SEGMENT_TIME, QUALITY_PROFILES
 
 MIN_SEGMENTS_BEFORE_SERVE = 1
+MAX_CONCURRENT_JOBS = 3
 
 
 def _get_encode_bitrate(source_kbps: int, target_kbps: int) -> int:
@@ -35,25 +36,22 @@ class TranscodeJob:
         self.finished = False
         self.error = False
         self.paused = False
+        self.queued = False
         self._initial_process: subprocess.Popen | None = None
 
     def _total_segments(self) -> int:
-        """从视频文件获取总时长并计算总 segment 数"""
         try:
-            import subprocess as sp
-            result = sp.run(
+            result = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", self.video_path],
                 capture_output=True, text=True, timeout=10,
             )
-            import json
-            info = json.loads(result.stdout)
+            info = __import__("json").loads(result.stdout)
             duration = float(info["format"]["duration"])
             return max(1, math.ceil(duration / HLS_SEGMENT_TIME))
         except Exception:
             return 0
 
     def _cached_indices(self) -> set[int]:
-        """扫描缓存中已有的 segment 绝对编号"""
         indices = set()
         if self.output_dir.exists():
             for f in self.output_dir.glob("seg_*.ts"):
@@ -66,9 +64,7 @@ class TranscodeJob:
         return len(self._cached_indices())
 
     def _run_ffmpeg(self, seek_position: float = 0) -> subprocess.Popen:
-        """统一的 ffmpeg 启动（从头或从指定位置）"""
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
-
         w, h, v_bitrate, a_bitrate = QUALITY_PROFILES[self.quality]
         v_bitrate = _get_encode_bitrate(self.source_bitrate_kbps, v_bitrate)
 
@@ -92,21 +88,14 @@ class TranscodeJob:
             "-hls_segment_filename", str(self.tmp_dir / "seg_%05d.ts"),
             str(self.tmp_dir / "playlist.m3u8"),
         ]
-
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _move_segments(self, start_seg: int):
-        """后台线程：持续将完成的 segment 从临时目录移入缓存目录"""
         next_idx = 0
         while True:
             tmp_file = self.tmp_dir / f"seg_{next_idx:05d}.ts"
             next_tmp = self.tmp_dir / f"seg_{next_idx + 1:05d}.ts"
 
-            # 当前 segment 存在，且下一个也存在（说明当前已写完）或进程已结束
             if tmp_file.exists() and (next_tmp.exists() or not self.is_alive()):
                 abs_idx = start_seg + next_idx
                 dest = self.output_dir / f"seg_{abs_idx:05d}.ts"
@@ -123,17 +112,12 @@ class TranscodeJob:
                 next_idx += 1
                 continue
 
-            # 进程已结束且没有更多文件
             if not self.is_alive() and not tmp_file.exists():
                 break
 
             time.sleep(0.5)
 
-        # 清理临时目录
-        try:
-            shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def start(self) -> bool:
         with self._lock:
@@ -143,27 +127,28 @@ class TranscodeJob:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 检查是否已完全缓存
         cached = self._cached_indices()
         total = self._total_segments()
         if cached and total > 0 and max(cached) >= total - 1:
             self.ready = True
             self.finished = True
+            _pool.on_job_finished(self)
             return True
 
         try:
-            self.process = self._run_ffmpeg(0)
+            start_seg = (max(cached) + 1) if cached else 0
+            seek_pos = start_seg * HLS_SEGMENT_TIME
+            self.process = self._run_ffmpeg(seek_pos)
             self._initial_process = self.process
-            threading.Thread(target=self._wait_ready, args=(0,), daemon=True).start()
+            threading.Thread(target=self._wait_ready, args=(start_seg,), daemon=True).start()
             return True
         except Exception:
             self.started = False
             self.error = True
+            _pool.on_job_finished(self)
             return False
 
     def _wait_ready(self, start_seg: int):
-        """等待至少 MIN_SEGMENTS_BEFORE_SERVE 个分片生成，同时持续移动 segment"""
-        # 启动 segment 移动线程
         threading.Thread(target=self._move_segments, args=(start_seg,), daemon=True).start()
 
         timeout = 60
@@ -175,6 +160,7 @@ class TranscodeJob:
                     self.finished = True
                 else:
                     self.error = True
+                _pool.on_job_finished(self)
                 return
             first_seg = self.output_dir / f"seg_{start_seg:05d}.ts"
             if first_seg.exists():
@@ -183,21 +169,17 @@ class TranscodeJob:
             time.sleep(1)
             waited += 1
 
-        # 继续监控转码进程
         if self.process:
             self.process.wait()
-            self.finished = True
+        self.finished = True
+        _pool.on_job_finished(self)
 
     def start_seek(self, position: float) -> bool:
-        """从指定位置开始转码（跳转）"""
         start_seg = int(position) // HLS_SEGMENT_TIME
         cached = self._cached_indices()
-
-        # 目标 segment 已存在 → 无需转码
         if start_seg in cached:
             return True
 
-        # 停止旧的 seek 进程（非初始进程）
         if self.process and self.process != self._initial_process and self.process.poll() is None:
             try:
                 self.process.terminate()
@@ -209,7 +191,6 @@ class TranscodeJob:
         except Exception:
             return False
 
-        # 终止初始转码（seek 位置已超过初始进度）
         if self._initial_process and self._initial_process.poll() is None:
             try:
                 self._initial_process.terminate()
@@ -244,7 +225,6 @@ class TranscodeJob:
         return False
 
     def wait_ready(self, timeout: float = 30.0) -> bool:
-        """等待直到有足够分片可播放"""
         waited = 0
         while waited < timeout:
             if self.ready:
@@ -256,67 +236,126 @@ class TranscodeJob:
         return self.ready
 
 
-# 全局转码任务管理
-_jobs: dict[str, TranscodeJob] = {}
-_jobs_lock = threading.Lock()
+# ---------- Worker 池：最多 MAX_CONCURRENT_JOBS 个视频同时转码 ----------
+
+class _WorkerPool:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running: set[str] = set()  # job keys currently running
+        self._queue: list[str] = []      # queued job keys
+        self._jobs: dict[str, TranscodeJob] = {}
+
+    def submit(self, job: TranscodeJob) -> TranscodeJob:
+        key = f"{job.video_id}:{job.quality}"
+        with self._lock:
+            existing = self._jobs.get(key)
+            if existing and not existing.error:
+                if existing.is_alive() or existing.finished:
+                    return existing
+                del self._jobs[key]
+
+            self._jobs[key] = job
+
+            if len(self._running) < MAX_CONCURRENT_JOBS:
+                self._running.add(key)
+                threading.Thread(target=self._start_job, args=(job,), daemon=True).start()
+            else:
+                job.queued = True
+                self._queue.append(key)
+
+        return job
+
+    def _start_job(self, job: TranscodeJob):
+        job.start()
+
+    def on_job_finished(self, job: TranscodeJob):
+        key = f"{job.video_id}:{job.quality}"
+        with self._lock:
+            self._running.discard(key)
+            # 从队列取下一个
+            while self._queue:
+                next_key = self._queue.pop(0)
+                next_job = self._jobs.get(next_key)
+                if next_job and not next_job.started:
+                    next_job.queued = False
+                    self._running.add(next_key)
+                    threading.Thread(target=self._start_job, args=(next_job,), daemon=True).start()
+                    break
+
+    def get_job(self, video_id: str, quality: str) -> TranscodeJob | None:
+        key = f"{video_id}:{quality}"
+        with self._lock:
+            return self._jobs.get(key)
+
+    def get_all_active_jobs(self) -> dict[str, dict]:
+        result = {}
+        with self._lock:
+            for key, job in self._jobs.items():
+                if job.finished and not job.paused:
+                    continue
+                vid = job.video_id
+                seg_count = job._segment_count()
+                if job.queued:
+                    status = "queued"
+                    pct = 0
+                elif job.finished:
+                    status = "done"
+                    pct = 100
+                elif job.paused:
+                    status = "paused"
+                    pct = min(99, seg_count * 5)
+                elif job.error:
+                    status = "error"
+                    pct = 0
+                else:
+                    status = "caching"
+                    pct = min(99, seg_count * 5)
+                result[vid] = {"percent": pct, "status": status, "quality": job.quality}
+        return result
+
+    def invalidate_video(self, video_id: str):
+        with self._lock:
+            keys_to_remove = [k for k in self._jobs if k.startswith(f"{video_id}:")]
+            for k in keys_to_remove:
+                job = self._jobs[k]
+                if job.is_alive():
+                    job.process.terminate()
+                self._running.discard(k)
+                if k in self._queue:
+                    self._queue.remove(k)
+                del self._jobs[k]
+
+    def invalidate_all(self):
+        with self._lock:
+            for job in self._jobs.values():
+                if job.is_alive():
+                    try:
+                        job.process.terminate()
+                    except (ProcessLookupError, OSError):
+                        pass
+            self._jobs.clear()
+            self._running.clear()
+            self._queue.clear()
+
+
+_pool = _WorkerPool()
 
 
 def get_or_start_transcode(video_path: str, video_id: str, quality: str,
                            source_bitrate_kbps: int = 0) -> TranscodeJob:
-    key = f"{video_id}:{quality}"
-    with _jobs_lock:
-        job = _jobs.get(key)
-        if job and not job.error:
-            if job.is_alive() or job.finished:
-                return job
-            # 文件已删除，清除旧 job
-            del _jobs[key]
-        job = TranscodeJob(video_path, video_id, quality, source_bitrate_kbps)
-        _jobs[key] = job
-    job.start()
-    return job
+    job = TranscodeJob(video_path, video_id, quality, source_bitrate_kbps)
+    return _pool.submit(job)
 
 
 def get_job(video_id: str, quality: str) -> TranscodeJob | None:
-    key = f"{video_id}:{quality}"
-    with _jobs_lock:
-        return _jobs.get(key)
+    return _pool.get_job(video_id, quality)
 
 
 def get_all_active_jobs() -> dict[str, dict]:
-    """返回所有活跃转码任务的进度信息"""
-    result = {}
-    with _jobs_lock:
-        for key, job in _jobs.items():
-            if job.finished and not job.paused:
-                continue
-            vid = job.video_id
-            seg_count = job._segment_count()
-            if job.finished:
-                status = "done"
-                pct = 100
-            elif job.paused:
-                status = "paused"
-                pct = min(99, seg_count * 5)
-            elif job.error:
-                status = "error"
-                pct = 0
-            else:
-                status = "caching"
-                pct = min(99, seg_count * 5)
-            result[vid] = {"percent": pct, "status": status, "quality": job.quality}
-    return result
+    return _pool.get_all_active_jobs()
 
 
 def generate_full_m3u8(video_id: str, quality: str, duration: float, start: float = 0, is_live: bool = False) -> str:
-    """动态生成覆盖完整视频时间线的 m3u8 播放列表。
-
-    扫描缓存目录中已有的 seg_NNNNN.ts 文件。
-    hls.js 请求不存在的 segment 时会收到 200 空响应（视为 gap）。
-
-    start > 0 时，生成从指定秒数开始的截断 m3u8。
-    is_live = True 时，不写 #EXT-X-ENDLIST，hls.js 会定期轮询。
-    """
     cache_dir = Path(config.get("cache_dir")) / video_id / quality
     prefix = f"/api/video/{video_id}/stream/{quality}/"
     total_segments = max(1, math.ceil(duration / HLS_SEGMENT_TIME))
@@ -324,7 +363,6 @@ def generate_full_m3u8(video_id: str, quality: str, duration: float, start: floa
     start_seg = max(0, int(start) // HLS_SEGMENT_TIME) if start > 0 else 0
     start_seg = min(start_seg, total_segments - 1)
 
-    # 只扫描 seg_NNNNN.ts
     available = set()
     if cache_dir.exists():
         for f in cache_dir.glob("seg_*.ts"):
@@ -357,23 +395,8 @@ def generate_full_m3u8(video_id: str, quality: str, duration: float, start: floa
 
 
 def invalidate_jobs(video_id: str):
-    """清除指定视频的所有转码任务引用（缓存被清除时调用）"""
-    with _jobs_lock:
-        keys_to_remove = [k for k in _jobs if k.startswith(f"{video_id}:")]
-        for k in keys_to_remove:
-            job = _jobs[k]
-            if job.is_alive():
-                job.process.terminate()
-            del _jobs[k]
+    _pool.invalidate_video(video_id)
 
 
 def invalidate_all_jobs():
-    """终止并清除所有转码任务"""
-    with _jobs_lock:
-        for job in _jobs.values():
-            if job.is_alive():
-                try:
-                    job.process.terminate()
-                except (ProcessLookupError, OSError):
-                    pass
-        _jobs.clear()
+    _pool.invalidate_all()

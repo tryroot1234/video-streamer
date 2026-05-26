@@ -7,8 +7,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import config
 
-MAX_CONCURRENT_TRANSCODE = 5
-_transcode_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSCODE)
+def get_max_concurrent() -> int:
+    return config.get("max_concurrent_transcode") or 1
+
+_transcode_semaphore = threading.Semaphore(get_max_concurrent())
+
+
+def update_concurrent_semaphore():
+    """设置变更后更新信号量"""
+    global _transcode_semaphore
+    _transcode_semaphore = threading.Semaphore(get_max_concurrent())
 
 
 def get_cache_size() -> int:
@@ -308,7 +316,7 @@ def start_batch_cache(videos: list[dict]):
             _batch_state["done"] += 1
 
     def _run():
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TRANSCODE) as pool:
+        with ThreadPoolExecutor(max_workers=get_max_concurrent()) as pool:
             futures = {pool.submit(_transcode_one, v): v for v in videos}
             for future in as_completed(futures):
                 with _batch_lock:
@@ -335,15 +343,16 @@ def stop_batch_cache():
 
 
 def _find_job(video_id: str):
-    from transcoder import get_job, _jobs, _jobs_lock
+    from transcoder import get_job
     # Try recommended quality first
     job = get_job(video_id, "720p")
     if not job:
-        with _jobs_lock:
-            for key, j in _jobs.items():
-                if j.video_id == video_id and not j.finished:
-                    job = j
-                    break
+        # Try other qualities
+        for q in ("1080p", "480p", "360p"):
+            job = get_job(video_id, q)
+            if job and not job.finished:
+                break
+            job = None
     return job
 
 
@@ -447,15 +456,33 @@ def start_auto_pretranscode(videos: list[dict]):
         })
 
     def _run():
+        from transcoder import get_or_start_transcode
+
+        # 批量提交到 worker 池（池自动限制并发）
+        jobs = []
         for v in queue:
-            # 检查停止信号
             if _pretranscode_stop_event.is_set():
                 break
-            # 批量缓存运行时暂停
+            vid = v["id"]
+            quality = v.get("recommended_quality", "720p")
+            if is_cached(vid, quality, v.get("duration")):
+                with _pretranscode_lock:
+                    _pretranscode_state["done"] += 1
+                continue
+            can, reason = can_cache_more()
+            if not can:
+                print(f"[预转码] 停止: {reason}")
+                break
+            job = get_or_start_transcode(v["path"], vid, quality)
+            jobs.append((v, job))
+
+        # 轮询等待所有 job 完成
+        while jobs:
+            if _pretranscode_stop_event.is_set():
+                break
             with _batch_lock:
                 if _batch_state["running"]:
                     break
-            # 用户暂停时等待
             while True:
                 if _pretranscode_stop_event.is_set():
                     break
@@ -466,59 +493,27 @@ def start_auto_pretranscode(videos: list[dict]):
             if _pretranscode_stop_event.is_set():
                 break
 
-            vid = v["id"]
-            quality = v.get("recommended_quality", "720p")
+            done_now = []
+            running_names = []
+            for v, job in jobs:
+                if job.finished or job.error:
+                    done_now.append((v, job))
+                    if job.error:
+                        print(f"[预转码] 失败: {v['name']}")
+                    else:
+                        print(f"[预转码] 完成: {v['name']}")
+                elif not job.queued:
+                    running_names.append(v["name"])
 
-            # 再次检查是否已缓存（可能在等待期间被用户手动缓存了）
-            if is_cached(vid, quality, v.get("duration")):
+            for item in done_now:
+                jobs.remove(item)
                 with _pretranscode_lock:
                     _pretranscode_state["done"] += 1
-                continue
-
-            # 检查磁盘空间
-            can, reason = can_cache_more()
-            if not can:
-                print(f"[预转码] 停止: {reason}")
-                break
 
             with _pretranscode_lock:
-                _pretranscode_state["current"] = v["name"]
-                _pretranscode_state["current_video_id"] = vid
+                _pretranscode_state["current"] = ", ".join(running_names[:3]) if running_names else ""
 
-            try:
-                from transcoder import get_or_start_transcode
-                job = get_or_start_transcode(v["path"], vid, quality)
-                while job.is_alive():
-                    if _pretranscode_stop_event.is_set():
-                        # 用户停止：终止 ffmpeg 进程
-                        if job.is_alive():
-                            try:
-                                job.process.terminate()
-                            except (ProcessLookupError, OSError):
-                                pass
-                        break
-                    with _batch_lock:
-                        if _batch_state["running"]:
-                            # 批量缓存启动，暂停预转码
-                            if job.is_alive():
-                                try:
-                                    job.process.terminate()
-                                except (ProcessLookupError, OSError):
-                                    pass
-                            break
-                    time.sleep(2)
-
-                if job.error:
-                    print(f"[预转码] 失败: {v['name']}")
-                else:
-                    print(f"[预转码] 完成: {v['name']}")
-            except Exception as e:
-                print(f"[预转码] 异常: {v['name']}: {e}")
-
-            with _pretranscode_lock:
-                _pretranscode_state["done"] += 1
-                _pretranscode_state["current"] = ""
-                _pretranscode_state["current_video_id"] = ""
+            time.sleep(2)
 
         with _pretranscode_lock:
             _pretranscode_state["running"] = False

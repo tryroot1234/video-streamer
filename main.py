@@ -1,9 +1,13 @@
 import asyncio
 import glob
+import json
+import math
 import os
 import re
+import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -16,7 +20,7 @@ from pydantic import BaseModel
 
 import config
 from video_scanner import scan_videos
-from transcoder import get_or_start_transcode, generate_full_m3u8, get_job
+from transcoder import get_or_start_transcode, generate_full_m3u8
 from cache_manager import is_cached
 
 
@@ -44,7 +48,6 @@ async def lifespan(app: FastAPI):
     config.load_settings()
     Path(config.get("cache_dir")).mkdir(parents=True, exist_ok=True)
     cleanup_old_processes()
-    _load_html_cache()
     # 刷新视频列表后自动启动预转码
     def _init_with_pretranscode():
         videos = refresh_videos()
@@ -60,23 +63,42 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 _video_cache: dict[str, dict] = {}
 _last_scan: float = 0
 _scan_interval = 60
+_scanning: bool = False
 
-# ---------- HTML Cache ----------
-_html_cache: dict[str, str] = {}
-
-
-def _load_html_cache():
-    static_dir = Path(__file__).parent / "static"
-    for name in ("home.html", "library.html"):
-        _html_cache[name] = (static_dir / name).read_text(encoding="utf-8")
+# ---------- HTML ----------
+_static_dir = Path(__file__).parent / "static"
 
 
 def refresh_videos(force: bool = False):
-    global _video_cache, _last_scan
-    if force or time.time() - _last_scan > _scan_interval:
+    global _video_cache, _last_scan, _scanning
+    now = time.time()
+
+    # 缓存未过期 → 直接返回
+    if not force and now - _last_scan < _scan_interval and _video_cache:
+        return list(_video_cache.values())
+
+    # 正在扫描中 → 返回旧数据
+    if _scanning and _video_cache:
+        return list(_video_cache.values())
+
+    # 冷启动（无缓存）→ 同步等待首次扫描
+    if not _video_cache:
         videos = scan_videos()
         _video_cache = {v["id"]: v for v in videos}
-        _last_scan = time.time()
+        _last_scan = now
+        return list(_video_cache.values())
+
+    # 缓存过期 → 后台刷新，立即返回旧数据
+    _scanning = True
+    def _bg_scan():
+        global _video_cache, _last_scan, _scanning
+        try:
+            videos = scan_videos()
+            _video_cache = {v["id"]: v for v in videos}
+            _last_scan = time.time()
+        finally:
+            _scanning = False
+    threading.Thread(target=_bg_scan, daemon=True).start()
     return list(_video_cache.values())
 
 
@@ -86,6 +108,7 @@ class SettingsUpdate(BaseModel):
     video_dirs: list[str] | None = None
     cache_dir: str | None = None
     max_cache_size_gb: int | None = None
+    max_concurrent_transcode: int | None = None
 
 
 @app.get("/api/settings")
@@ -96,9 +119,18 @@ async def api_get_settings():
 @app.put("/api/settings")
 async def api_update_settings(body: SettingsUpdate):
     old_video_dirs = config.get("video_dirs") or []
+    old_concurrent = config.get("max_concurrent_transcode")
     updated = config.update(body.model_dump(exclude_none=True))
     if updated.get("video_dirs") != old_video_dirs:
         refresh_videos(force=True)
+        from cache_manager import stop_pretranscode, start_auto_pretranscode
+        stop_pretranscode()
+        videos = list(_video_cache.values())
+        if videos:
+            start_auto_pretranscode(videos)
+    if updated.get("max_concurrent_transcode") != old_concurrent:
+        from cache_manager import update_concurrent_semaphore
+        update_concurrent_semaphore()
     return updated
 
 
@@ -106,12 +138,12 @@ async def api_update_settings(body: SettingsUpdate):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(_html_cache.get("home.html", ""))
+    return HTMLResponse((_static_dir / "home.html").read_text(encoding="utf-8"))
 
 
 @app.get("/library", response_class=HTMLResponse)
 async def library():
-    return HTMLResponse(_html_cache.get("library.html", ""))
+    return HTMLResponse((_static_dir / "library.html").read_text(encoding="utf-8"))
 
 
 @app.get("/api/videos")
@@ -149,12 +181,8 @@ async def api_stream(video_id: str, quality: str, request: Request, start: float
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, job.wait_ready, 30.0)
 
-    # 检查转码是否仍在进行中
-    job = get_job(video_id, quality)
-    is_live = job is not None and job.is_alive() and not job.finished
-
-    # 动态生成 m3u8（支持 start 参数从指定位置截断）
-    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0), start=start, is_live=is_live)
+    # 动态生成 VOD m3u8（始终返回完整时间线，hls.js 自动处理缺失分片）
+    m3u8 = generate_full_m3u8(video_id, quality, video.get("duration", 0), start=start, is_live=False)
     return Response(
         content=m3u8,
         media_type="application/vnd.apple.mpegurl",
@@ -200,6 +228,98 @@ async def api_segment(video_id: str, quality: str, segment: str):
     return Response(content=b"", status_code=200, media_type="video/mp2t")
 
 
+@app.get("/api/video/{video_id}/sprite")
+async def api_sprite(video_id: str):
+    refresh_videos()
+    video = _video_cache.get(video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    sprite_path = Path(config.get("cache_dir")) / video_id / "sprite.jpg"
+    meta_path = Path(config.get("cache_dir")) / video_id / "sprite.json"
+    if sprite_path.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        return FileResponse(sprite_path, media_type="image/jpeg",
+                            headers={"X-Sprite-Thumb-W": str(meta["thumb_w"]),
+                                     "X-Sprite-Thumb-H": str(meta["thumb_h"]),
+                                     "X-Sprite-Cols": str(meta["cols"]),
+                                     "X-Sprite-Interval": str(meta["interval"])})
+
+    duration = video.get("duration", 0)
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="Unknown duration")
+
+    thumb_w, thumb_h = 160, 90
+    cols = 10
+    interval = max(10, int(duration / 60))
+    total_frames = max(1, int(duration / interval))
+    rows = math.ceil(total_frames / cols)
+
+    sprite_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = sprite_path.parent / "_sprite_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 两步法：先并行提取缩略图，再拼接 sprite（避免 tile 滤镜缓冲所有帧）
+    async def _grab_thumb(idx: int):
+        ts = idx * interval
+        out = tmp_dir / f"t_{idx:04d}.jpg"
+        if out.exists():
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-ss", str(ts), "-i", video["path"],
+            "-vframes", "1", "-vf", f"scale={thumb_w}:{thumb_h}",
+            "-q:v", "5", str(out),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+
+    # 并行提取（最多 8 路并发）
+    sem = asyncio.Semaphore(8)
+    async def _grab_with_sem(idx):
+        async with sem:
+            await _grab_thumb(idx)
+    await asyncio.gather(*[_grab_with_sem(i) for i in range(total_frames)])
+
+    # 拼接 sprite（用 concat demuxer，避免 tile+多 -i 出黑图）
+    inputs = []
+    for i in range(total_frames):
+        p = tmp_dir / f"t_{i:04d}.jpg"
+        if p.exists():
+            inputs.append(p)
+    if not inputs:
+        raise HTTPException(status_code=404, detail="Sprite generation failed")
+
+    actual_rows = math.ceil(len(inputs) / cols)
+    concat_file = tmp_dir / "concat.txt"
+    concat_file.write_text("".join(f"file '{p.name}'\n" for p in inputs))
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-filter_complex", f"tile={cols}x{actual_rows}",
+        "-frames:v", "1", "-q:v", "5", str(sprite_path),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+
+    # 清理临时文件
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if sprite_path.exists():
+        meta = {"thumb_w": thumb_w, "thumb_h": thumb_h, "cols": cols, "interval": interval}
+        meta_path.write_text(json.dumps(meta))
+        return FileResponse(sprite_path, media_type="image/jpeg",
+                            headers={"X-Sprite-Thumb-W": str(thumb_w),
+                                     "X-Sprite-Thumb-H": str(thumb_h),
+                                     "X-Sprite-Cols": str(cols),
+                                     "X-Sprite-Interval": str(interval)})
+    raise HTTPException(status_code=404, detail="Sprite generation failed")
+
+
 @app.get("/api/video/{video_id}/thumbnail")
 async def api_thumbnail(video_id: str):
     refresh_videos()
@@ -210,13 +330,16 @@ async def api_thumbnail(video_id: str):
     thumb_path = Path(config.get("cache_dir")) / video_id / "thumb.jpg"
     if not thumb_path.exists():
         thumb_path.parent.mkdir(parents=True, exist_ok=True)
+        # 跳到视频 10% 处抓帧，避开片头黑屏
+        seek_to = max(1, int(video.get("duration", 60) * 0.1))
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", video["path"], "-ss", "5", "-vframes", "1",
-            "-vf", "scale=320:-1", str(thumb_path),
+            "ffmpeg", "-y", "-ss", str(seek_to), "-i", video["path"],
+            "-vf", "scale=320:-1",
+            "-frames:v", "1", str(thumb_path),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         try:
-            await asyncio.wait_for(proc.wait(), timeout=15)
+            await asyncio.wait_for(proc.wait(), timeout=30)
         except asyncio.TimeoutError:
             proc.kill()
     if thumb_path.exists():

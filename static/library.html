@@ -3,22 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>视频库 - 视频流媒体服务器</title>
+    <title data-i18n="pageTitle">视频库 - 视频流媒体服务器</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=6">
     <script src="/static/hls.min.js"></script>
 </head>
 <body>
     <header>
         <div class="header-left">
-            <a href="/" class="header-home" title="首页">
+            <a href="/" class="header-home" title="首页" data-i18n-title="homeTitle">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
             </a>
-            <h1>视频库</h1>
+            <h1 data-i18n="library">视频库</h1>
         </div>
         <div class="header-right">
             <div id="status"></div>
-            <button id="settings-btn" onclick="toggleSettings()" title="设置">
+            <button id="lang-btn" class="lang-btn" onclick="toggleLang()" title="EN/中文">EN</button>
+            <button id="settings-btn" onclick="toggleSettings()" title="设置" data-i18n-title="settingsTitle">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
                 </svg>
@@ -30,27 +31,36 @@
     <div id="settings-overlay" class="hidden" onclick="toggleSettings()"></div>
     <div id="settings-panel" class="hidden">
         <div class="settings-header">
-            <h2>设置</h2>
+            <h2 data-i18n="settings">设置</h2>
             <button class="close-btn" onclick="toggleSettings()">&times;</button>
         </div>
         <div class="settings-body">
             <div class="form-group">
-                <label>视频目录</label>
+                <label data-i18n="videoDirs">视频目录</label>
                 <div id="video-dirs-list"></div>
-                <button class="add-dir-btn" onclick="addVideoDir()">+ 添加目录</button>
-                <span class="hint">视频文件所在的本地路径，支持多个目录</span>
+                <button class="add-dir-btn" onclick="addVideoDir()" data-i18n="addDir">+ 添加目录</button>
+                <span class="hint" data-i18n="hintVideoDirs">视频文件所在的本地路径，支持多个目录</span>
             </div>
             <div class="form-group">
-                <label for="input-cache-dir">缓存目录</label>
+                <label for="input-cache-dir" data-i18n="cacheDir">缓存目录</label>
                 <input type="text" id="input-cache-dir" placeholder="/path/to/cache">
-                <span class="hint">转码后 HLS 分片的存储路径</span>
+                <span class="hint" data-i18n="hintCacheDir">转码后 HLS 分片的存储路径</span>
             </div>
             <div class="form-group">
-                <label for="input-max-cache">最大缓存大小 (GB)</label>
+                <label for="input-max-cache" data-i18n="maxCache">最大缓存大小 (GB)</label>
                 <input type="number" id="input-max-cache" min="1" max="500" value="50">
-                <span class="hint">超出后自动清理最旧的缓存</span>
+                <span class="hint" data-i18n="hintMaxCache">超出后自动清理最旧的缓存</span>
             </div>
-            <button id="save-btn" class="primary-btn" onclick="saveSettings()">保存</button>
+            <div class="form-group">
+                <label for="input-max-concurrent" data-i18n="concurrent">转码并发数</label>
+                <select id="input-max-concurrent">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3" selected>3</option>
+                </select>
+                <span class="hint" data-i18n="hintConcurrent">同时转码的视频数量，降低可减少系统负载</span>
+            </div>
+            <button id="save-btn" class="primary-btn" onclick="saveSettings()" data-i18n="save">保存</button>
             <div id="settings-msg" class="hidden"></div>
         </div>
     </div>
@@ -59,22 +69,27 @@
         <!-- 排序和分页控件 -->
         <div class="toolbar" id="toolbar">
             <div class="toolbar-left">
+                <div class="search-box">
+                    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    <input type="text" id="search-input" data-i18n-placeholder="searchPlaceholder" placeholder="搜索文件名..." oninput="onSearchInput(this.value)">
+                    <button class="search-clear hidden" id="search-clear" onclick="clearSearch()">&times;</button>
+                </div>
                 <div class="sort-group">
-                    <label>排序:</label>
+                    <label data-i18n="sortLabel">排序:</label>
                     <select id="sort-select" onchange="changeSort(this.value)">
-                        <option value="name-asc">名称 A-Z</option>
-                        <option value="name-desc">名称 Z-A</option>
-                        <option value="time-desc" selected>最新优先</option>
-                        <option value="time-asc">最早优先</option>
-                        <option value="size-desc">最大优先</option>
-                        <option value="size-asc">最小优先</option>
+                        <option value="name-asc" data-i18n="sortNameAsc">名称 A-Z</option>
+                        <option value="name-desc" data-i18n="sortNameDesc">名称 Z-A</option>
+                        <option value="time-desc" selected data-i18n="sortTimeDesc">最新优先</option>
+                        <option value="time-asc" data-i18n="sortTimeAsc">最早优先</option>
+                        <option value="size-desc" data-i18n="sortSizeDesc">最大优先</option>
+                        <option value="size-asc" data-i18n="sortSizeAsc">最小优先</option>
                     </select>
                 </div>
-                <button id="cache-init-btn" class="cache-btn" onclick="startBatchCache()">一键缓存全部</button>
-                <button id="cache-stop-btn" class="cache-btn cache-btn-stop hidden" onclick="stopBatchCache()">停止缓存</button>
-                <button id="cache-clear-all-btn" class="cache-btn cache-btn-stop" onclick="clearAllCache()">一键清除全部</button>
+                <button id="cache-init-btn" class="cache-btn" onclick="startBatchCache()" data-i18n="cacheAll">一键缓存全部</button>
+                <button id="cache-stop-btn" class="cache-btn cache-btn-stop hidden" onclick="stopBatchCache()" data-i18n="stopCache">停止缓存</button>
+                <button id="cache-clear-all-btn" class="cache-btn cache-btn-stop" onclick="clearAllCache()" data-i18n="clearAll">一键清除全部</button>
                 <div class="sort-group">
-                    <label>每页:</label>
+                    <label data-i18n="perPage">每页:</label>
                     <select id="perpage-select" onchange="changePerPage(this.value)">
                         <option value="12" selected>12</option>
                         <option value="24">24</option>
@@ -109,7 +124,7 @@
         <!-- 视频库 -->
         <section id="library" class="active">
             <div id="video-grid"></div>
-            <div id="loading">加载中...</div>
+            <div id="loading" data-i18n="loading">加载中...</div>
         </section>
 
         <!-- 分页 -->
@@ -117,7 +132,7 @@
 
         <!-- 播放器 -->
         <section id="player-section" class="hidden">
-            <button id="back-btn" onclick="goBack()">&#8592; 返回</button>
+            <button id="back-btn" onclick="goBack()" data-i18n="back">&#8592; 返回</button>
             <div class="player-wrapper">
                 <video id="video-player" playsinline></video>
                 <div class="custom-controls">
@@ -126,6 +141,10 @@
                         <svg id="icon-pause" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="5" y="3" width="4" height="18"/><rect x="15" y="3" width="4" height="18"/></svg>
                     </button>
                     <div class="progress-container" id="progress-container">
+                        <div class="progress-tooltip" id="progress-tooltip">
+                            <div class="tooltip-thumb" id="tooltip-thumb"></div>
+                            <span class="tooltip-time" id="tooltip-time">0:00</span>
+                        </div>
                         <div class="progress-track">
                             <div class="progress-transcoded" id="progress-transcoded"></div>
                             <div class="progress-buffered" id="progress-buffered"></div>
@@ -142,11 +161,11 @@
             <div id="video-info"></div>
             <div class="player-controls">
                 <div id="quality-selector">
-                    <label>画质:</label>
+                    <label data-i18n="quality">画质:</label>
                     <select id="quality-select" onchange="switchQuality(this.value)">
                     </select>
                 </div>
-                <button id="clear-cache-btn" class="cache-btn cache-btn-stop" onclick="clearCurrentVideoCache()">清除缓存</button>
+                <button id="clear-cache-btn" class="cache-btn cache-btn-stop" onclick="clearCurrentVideoCache()" data-i18n="clearCache">清除缓存</button>
             </div>
         </section>
     </main>
@@ -155,24 +174,24 @@
     <div id="cache-modal-overlay" class="modal-overlay hidden" onclick="closeCacheModal()"></div>
     <div id="cache-modal" class="modal hidden">
         <div class="modal-header">
-            <h3>缓存不足</h3>
+            <h3 data-i18n="cacheInsufficient">缓存不足</h3>
             <button class="close-btn" onclick="closeCacheModal()">&times;</button>
         </div>
         <div class="modal-body">
             <p id="cache-modal-msg"></p>
             <div class="modal-actions">
-                <button class="primary-btn" onclick="expandCacheAndPlay()">更改最大缓存大小</button>
-                <button class="secondary-btn" onclick="evictAndPlay()">覆盖最早缓存并播放</button>
+                <button class="primary-btn" onclick="expandCacheAndPlay()" data-i18n="expandCache">更改最大缓存大小</button>
+                <button class="secondary-btn" onclick="evictAndPlay()" data-i18n="evictAndPlay">覆盖最早缓存并播放</button>
             </div>
             <div id="cache-modal-expand" class="hidden">
                 <div class="form-group">
-                    <label>新的最大缓存大小 (GB)</label>
+                    <label data-i18n="newMaxCache">新的最大缓存大小 (GB)</label>
                     <input type="number" id="new-max-cache" min="1" max="500">
                     <span id="cache-modal-hint" class="hint"></span>
                 </div>
                 <div class="modal-actions">
-                    <button class="primary-btn" onclick="confirmExpandAndPlay()">确认并播放</button>
-                    <button class="secondary-btn" onclick="closeCacheModal()">取消</button>
+                    <button class="primary-btn" onclick="confirmExpandAndPlay()" data-i18n="confirmPlay">确认并播放</button>
+                    <button class="secondary-btn" onclick="closeCacheModal()" data-i18n="cancel">取消</button>
                 </div>
             </div>
             <div id="cache-modal-msg2" class="hidden"></div>
@@ -183,10 +202,10 @@
     <div id="loading-overlay" class="modal-overlay hidden">
         <div class="loading-spinner">
             <div class="spinner"></div>
-            <p id="loading-overlay-msg">正在加载...</p>
+            <p id="loading-overlay-msg" data-i18n="loadingMsg">正在加载...</p>
         </div>
     </div>
 
-    <script src="/static/library.js"></script>
+    <script src="/static/library.js?v=7"></script>
 </body>
 </html>

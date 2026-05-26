@@ -10,6 +10,7 @@ build/
 
 # 项目运行时文件
 settings.json
+video_cache.json
 cache/
 
 # macOS

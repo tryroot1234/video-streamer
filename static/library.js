@@ -8,6 +8,138 @@
  * 第一性原理：从「用户想看视频某个位置」出发推导代码结构
  */
 
+// ---------- i18n ----------
+
+const _i18n = {
+    zh: {
+        pageTitle: "视频库 - 视频流媒体服务器",
+        homeTitle: "首页",
+        library: "视频库",
+        settingsTitle: "设置",
+        settings: "设置",
+        videoDirs: "视频目录",
+        addDir: "+ 添加目录",
+        hintVideoDirs: "视频文件所在的本地路径，支持多个目录",
+        cacheDir: "缓存目录",
+        hintCacheDir: "转码后 HLS 分片的存储路径",
+        maxCache: "最大缓存大小 (GB)",
+        hintMaxCache: "超出后自动清理最旧的缓存",
+        concurrent: "转码并发数",
+        hintConcurrent: "同时转码的视频数量，降低可减少系统负载",
+        save: "保存",
+        searchPlaceholder: "搜索文件名...",
+        sortLabel: "排序:",
+        sortNameAsc: "名称 A-Z",
+        sortNameDesc: "名称 Z-A",
+        sortTimeDesc: "最新优先",
+        sortTimeAsc: "最早优先",
+        sortSizeDesc: "最大优先",
+        sortSizeAsc: "最小优先",
+        cacheAll: "一键缓存全部",
+        stopCache: "停止缓存",
+        clearAll: "一键清除全部",
+        perPage: "每页:",
+        loading: "加载中...",
+        back: "← 返回",
+        quality: "画质:",
+        clearCache: "清除缓存",
+        cacheInsufficient: "缓存不足",
+        expandCache: "更改最大缓存大小",
+        evictAndPlay: "覆盖最早缓存并播放",
+        newMaxCache: "新的最大缓存大小 (GB)",
+        confirmPlay: "确认并播放",
+        cancel: "取消",
+        loadingMsg: "正在加载...",
+        pretranscodeIdle: "预转码准备中",
+        pretranscodeRunning: "预转码中",
+        batchCaching: "批量缓存中",
+        batchDone: "批量缓存完成",
+        diskWarning: "磁盘空间不足",
+        pageOf: "第 {cur} / {total} 页",
+        settingsMsgSave: "保存成功",
+    },
+    en: {
+        pageTitle: "Video Library - Video Streamer",
+        homeTitle: "Home",
+        library: "Video Library",
+        settingsTitle: "Settings",
+        settings: "Settings",
+        videoDirs: "Video Directories",
+        addDir: "+ Add Directory",
+        hintVideoDirs: "Local paths to video files, multiple directories supported",
+        cacheDir: "Cache Directory",
+        hintCacheDir: "Storage path for transcoded HLS segments",
+        maxCache: "Max Cache Size (GB)",
+        hintMaxCache: "Auto-evicts oldest cache when exceeded",
+        concurrent: "Concurrent Transcodes",
+        hintConcurrent: "Number of parallel transcode workers, lower = less system load",
+        save: "Save",
+        searchPlaceholder: "Search filenames...",
+        sortLabel: "Sort:",
+        sortNameAsc: "Name A-Z",
+        sortNameDesc: "Name Z-A",
+        sortTimeDesc: "Newest First",
+        sortTimeAsc: "Oldest First",
+        sortSizeDesc: "Largest First",
+        sortSizeAsc: "Smallest First",
+        cacheAll: "Cache All",
+        stopCache: "Stop",
+        clearAll: "Clear All Cache",
+        perPage: "Per page:",
+        loading: "Loading...",
+        back: "← Back",
+        quality: "Quality:",
+        clearCache: "Clear Cache",
+        cacheInsufficient: "Insufficient Cache",
+        expandCache: "Increase Max Cache",
+        evictAndPlay: "Overwrite Oldest & Play",
+        newMaxCache: "New Max Cache Size (GB)",
+        confirmPlay: "Confirm & Play",
+        cancel: "Cancel",
+        loadingMsg: "Loading...",
+        pretranscodeIdle: "Preparing pre-transcode",
+        pretranscodeRunning: "Pre-transcoding",
+        batchCaching: "Batch caching",
+        batchDone: "Batch cache complete",
+        diskWarning: "Low disk space",
+        pageOf: "Page {cur} / {total}",
+        settingsMsgSave: "Settings saved",
+    },
+};
+
+let _lang = localStorage.getItem("lang") || "zh";
+
+function t(key) {
+    return _i18n[_lang]?.[key] || _i18n.zh[key] || key;
+}
+
+function _applyLang() {
+    document.documentElement.lang = _lang === "zh" ? "zh-CN" : "en";
+    // data-i18n → textContent
+    document.querySelectorAll("[data-i18n]").forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+    });
+    // data-i18n-placeholder
+    document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
+        el.placeholder = t(el.dataset.i18nPlaceholder);
+    });
+    // data-i18n-title
+    document.querySelectorAll("[data-i18n-title]").forEach(el => {
+        el.title = t(el.dataset.i18nTitle);
+    });
+    // language button shows the OTHER language
+    const btn = document.getElementById("lang-btn");
+    if (btn) btn.textContent = _lang === "zh" ? "EN" : "中文";
+}
+
+function toggleLang() {
+    _lang = _lang === "zh" ? "en" : "zh";
+    localStorage.setItem("lang", _lang);
+    _applyLang();
+}
+
+// ---------- Globals ----------
+
 let hls = null;
 let currentVideo = null;
 let currentQuality = null;
@@ -17,6 +149,7 @@ let allVideos = [];
 let currentPage = 1;
 let perPage = 12;
 let currentSort = "time-desc";
+let searchQuery = "";
 
 let batchPollTimer = null;
 let activePollTimer = null;
@@ -31,6 +164,7 @@ async function loadSettings() {
         renderVideoDirs(s.video_dirs || []);
         document.getElementById("input-cache-dir").value = s.cache_dir || "";
         document.getElementById("input-max-cache").value = s.max_cache_size_gb || 50;
+        document.getElementById("input-max-concurrent").value = s.max_concurrent_transcode || 1;
     } catch (e) {
         console.error("Failed to load settings", e);
     }
@@ -65,10 +199,19 @@ async function saveSettings() {
     const dirInputs = document.querySelectorAll("#video-dirs-list .dir-input");
     const video_dirs = Array.from(dirInputs).map(el => el.value.trim()).filter(Boolean);
 
+    if (video_dirs.length === 0) {
+        msg.textContent = "至少需要一个视频目录";
+        msg.className = "error";
+        msg.classList.remove("hidden");
+        btn.disabled = false;
+        return;
+    }
+
     const body = {
         video_dirs,
         cache_dir: document.getElementById("input-cache-dir").value.trim(),
         max_cache_size_gb: parseInt(document.getElementById("input-max-cache").value, 10),
+        max_concurrent_transcode: parseInt(document.getElementById("input-max-concurrent").value, 10),
     };
 
     try {
@@ -78,7 +221,7 @@ async function saveSettings() {
             body: JSON.stringify(body),
         });
         if (!res.ok) throw new Error(await res.text());
-        msg.textContent = "已保存，正在刷新视频列表...";
+        msg.textContent = t("settingsMsgSave");
         msg.className = "success";
         msg.classList.remove("hidden");
         loadVideos();
@@ -143,16 +286,36 @@ function sortVideos(videos, sortKey) {
     return sorted;
 }
 
+function onSearchInput(value) {
+    searchQuery = value.trim().toLowerCase();
+    const clearBtn = document.getElementById("search-clear");
+    clearBtn.classList.toggle("hidden", !searchQuery);
+    currentPage = 1;
+    applySortAndRender();
+}
+
+function clearSearch() {
+    const input = document.getElementById("search-input");
+    input.value = "";
+    searchQuery = "";
+    document.getElementById("search-clear").classList.add("hidden");
+    currentPage = 1;
+    applySortAndRender();
+}
+
 function applySortAndRender() {
-    const sorted = sortVideos(allVideos, currentSort);
+    const filtered = searchQuery
+        ? allVideos.filter(v => v.name.toLowerCase().includes(searchQuery))
+        : allVideos;
+    const sorted = sortVideos(filtered, currentSort);
     const totalPages = Math.ceil(sorted.length / perPage) || 1;
     if (currentPage > totalPages) currentPage = totalPages;
 
     const start = (currentPage - 1) * perPage;
     const pageVideos = sorted.slice(start, start + perPage);
 
-    renderLibrary(pageVideos);
-    renderPagination(totalPages, sorted.length);
+    renderLibrary(pageVideos, filtered.length);
+    renderPagination(totalPages, filtered.length);
 }
 
 function changeSort(value) {
@@ -187,12 +350,19 @@ function formatSize(bytes) {
     return (bytes / 1024).toFixed(0) + " KB";
 }
 
-function renderLibrary(videos) {
+function renderLibrary(videos, filteredCount) {
     const grid = document.getElementById("video-grid");
     const loading = document.getElementById("loading");
 
     if (allVideos.length === 0) {
         loading.textContent = "未找到视频，请点击右上角齿轮图标设置视频目录";
+        loading.classList.remove("hidden");
+        grid.innerHTML = "";
+        return;
+    }
+
+    if (filteredCount === 0 && searchQuery) {
+        loading.textContent = `没有匹配「${searchQuery}」的视频`;
         loading.classList.remove("hidden");
         grid.innerHTML = "";
         return;
@@ -236,16 +406,24 @@ function renderPagination(totalPages, totalItems) {
     const container = document.getElementById("pagination");
     const pageInfo = document.getElementById("page-info");
 
+    const prefix = searchQuery ? `搜索「${searchQuery}」` : "共";
+    if (totalItems === 0) {
+        container.innerHTML = "";
+        pageInfo.textContent = "";
+        return;
+    }
     if (totalPages <= 1) {
         container.innerHTML = "";
-        pageInfo.textContent = `共 ${totalItems} 个视频`;
+        pageInfo.textContent = `${prefix} ${totalItems} 个视频`;
         return;
     }
 
-    pageInfo.textContent = `共 ${totalItems} 个视频 · 第 ${currentPage}/${totalPages} 页`;
+    const pageStr = t("pageOf").replace("{cur}", currentPage).replace("{total}", totalPages);
+    pageInfo.textContent = `${prefix} ${totalItems} · ${pageStr}`;
 
     let html = "";
-    html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(${currentPage - 1})">&laquo;</button>`;
+    html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(1)" title="首页">&laquo;&laquo;</button>`;
+    html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(${currentPage - 1})" title="上一页">&laquo;</button>`;
 
     const range = 2;
     let start = Math.max(1, currentPage - range);
@@ -265,7 +443,8 @@ function renderPagination(totalPages, totalItems) {
         html += `<button onclick="goToPage(${totalPages})">${totalPages}</button>`;
     }
 
-    html += `<button ${currentPage === totalPages ? "disabled" : ""} onclick="goToPage(${currentPage + 1})">&raquo;</button>`;
+    html += `<button ${currentPage === totalPages ? "disabled" : ""} onclick="goToPage(${currentPage + 1})" title="下一页">&raquo;</button>`;
+    html += `<button ${currentPage === totalPages ? "disabled" : ""} onclick="goToPage(${totalPages})" title="尾页">&raquo;&raquo;</button>`;
 
     container.innerHTML = html;
 }
@@ -293,7 +472,7 @@ async function startBatchCache() {
         document.getElementById("batch-progress").classList.remove("hidden");
         pollBatchProgress();
     } catch (e) {
-        alert("启动批量缓存失败");
+        alert("Failed to start batch cache / 启动批量缓存失败");
     }
 }
 
@@ -340,7 +519,7 @@ function pollBatchProgress() {
             }
 
             if (s.running) {
-                currentEl.textContent = s.current ? `正在缓存: ${s.current}` : "";
+                currentEl.textContent = s.current ? `${t("batchCaching")}: ${s.current}` : "";
             } else {
                 clearInterval(batchPollTimer);
                 batchPollTimer = null;
@@ -417,9 +596,9 @@ function pollActiveProgress() {
                 if (pt.running && pt.total > 0) {
                     el.classList.remove("hidden");
                     if (pt.current) {
-                        el.innerHTML = `<div class="mini-spinner"></div> 预转码中: ${pt.current} (${pt.done}/${pt.total})`;
+                        el.innerHTML = `<div class="mini-spinner"></div> ${t("pretranscodeRunning")}: ${pt.current} (${pt.done}/${pt.total})`;
                     } else {
-                        el.innerHTML = `<div class="mini-spinner"></div> 预转码准备中 (${pt.done}/${pt.total})`;
+                        el.innerHTML = `<div class="mini-spinner"></div> ${t("pretranscodeIdle")} (${pt.done}/${pt.total})`;
                     }
                 } else {
                     el.classList.add("hidden");
@@ -473,7 +652,7 @@ async function checkDiskStatus() {
         const warn = document.getElementById("disk-warning");
 
         if (d.free_percent < 20) {
-            warn.textContent = `⚠ 磁盘可用空间不足 20% (剩余 ${d.free_percent}%)，请尽快扩容`;
+            warn.textContent = `⚠ ${t("diskWarning")} (< 20% — ${d.free_percent}% free)`;
             warn.classList.remove("hidden");
         } else if (!d.can_cache_more && d.stop_reason) {
             warn.textContent = `⚠ ${d.stop_reason}`;
@@ -495,7 +674,10 @@ async function showCacheModal(video) {
     const disk = await diskRes.json();
 
     const msg = document.getElementById("cache-modal-msg");
-    msg.innerHTML = `视频 <strong>${video.name}</strong> 暂无缓存。<br><br>当前最大缓存: ${formatSize(disk.max_cache_size)}<br>已用缓存: ${formatSize(disk.cache_size)}<br>磁盘可用: ${disk.free_percent}%`;
+    const noCache = _lang === "zh"
+        ? `视频 <strong>${video.name}</strong> 暂无缓存。<br><br>当前最大缓存: ${formatSize(disk.max_cache_size)}<br>已用缓存: ${formatSize(disk.cache_size)}<br>磁盘可用: ${disk.free_percent}%`
+        : `Video <strong>${video.name}</strong> is not cached.<br><br>Max cache: ${formatSize(disk.max_cache_size)}<br>Used: ${formatSize(disk.cache_size)}<br>Disk free: ${disk.free_percent}%`;
+    msg.innerHTML = noCache;
 
     document.getElementById("cache-modal-expand").classList.add("hidden");
     document.getElementById("cache-modal-msg2").classList.add("hidden");
@@ -516,7 +698,7 @@ async function expandCacheAndPlay() {
     const disk = await diskRes.json();
 
     if (disk.free_percent < 20) {
-        document.getElementById("cache-modal-msg2").textContent = `⚠ 磁盘可用空间不足 20% (剩余 ${disk.free_percent}%)，请先扩容磁盘空间`;
+        document.getElementById("cache-modal-msg2").textContent = `⚠ ${t("diskWarning")} (< 20% — ${disk.free_percent}% free)`;
         document.getElementById("cache-modal-msg2").className = "disk-warning";
         document.getElementById("cache-modal-msg2").classList.remove("hidden");
         return;
@@ -526,7 +708,9 @@ async function expandCacheAndPlay() {
     const currentMax = disk.max_cache_size / 1073741824;
 
     document.getElementById("new-max-cache").value = Math.min(maxAllowed, currentMax + 50);
-    document.getElementById("cache-modal-hint").textContent = `磁盘 80% 容量限制下最大可设为 ${maxAllowed} GB`;
+    document.getElementById("cache-modal-hint").textContent = _lang === "zh"
+        ? `磁盘 80% 容量限制下最大可设为 ${maxAllowed} GB`
+        : `Max allowed (80% disk): ${maxAllowed} GB`;
     document.getElementById("cache-modal-expand").classList.remove("hidden");
 }
 
@@ -661,17 +845,24 @@ function doPlay(video) {
     const vidEl = document.getElementById("video-player");
     const wrapper = document.querySelector(".player-wrapper");
 
-    // Safari / iOS：原生控件模式（原生 HLS 处理更稳定）
+    // 追踪已缓冲范围
+    _listen(vidEl, "timeupdate", () => {
+        const buf = vidEl.buffered;
+        for (let i = 0; i < buf.length; i++) {
+            if (buf.end(i) > playerState.maxSeekPosition) {
+                playerState.maxSeekPosition = buf.end(i);
+            }
+        }
+    });
+
+    const streamUrl = `/api/video/${encodeURIComponent(video.id)}/stream/${video.recommended_quality}`;
+
+    // Safari / iOS：原生 HLS + 自定义控件
     const ua = navigator.userAgent;
     const isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     const isDesktopSafari = !isIOS && /safari/i.test(ua) && !/chrome|crios|fxios|edg/i.test(ua);
     if ((isIOS || isDesktopSafari) && vidEl.canPlayType("application/vnd.apple.mpegurl")) {
         playerState.nativeHls = true;
-        playerState.nativeControls = true;
-        vidEl.controls = true;
-        wrapper.classList.add("native-controls-mode");
-
-        const streamUrl = `/api/video/${encodeURIComponent(video.id)}/stream/${video.recommended_quality}`;
         vidEl.muted = true;
         vidEl.src = streamUrl;
         const onMeta = () => {
@@ -681,46 +872,28 @@ function doPlay(video) {
             playerState.initialSeekDone = true;
         };
         vidEl.addEventListener("loadedmetadata", onMeta, { once: true });
-
-        // 追踪已缓冲范围（供画质切换等使用）
-        _listen(vidEl, "timeupdate", () => {
-            const buf = vidEl.buffered;
-            for (let i = 0; i < buf.length; i++) {
-                if (buf.end(i) > playerState.maxSeekPosition) {
-                    playerState.maxSeekPosition = buf.end(i);
-                }
-            }
-        });
-
         currentQuality = video.recommended_quality;
-        hideLoading();
-        setupTimeDisplay();
-        return;
     }
 
-    // Chrome / Safari 17+：hls.js + 自定义控件
-    vidEl.controls = false;
-    wrapper.classList.remove("native-controls-mode");
+    // Chrome 等 + Safari 自定义控件（所有浏览器通用）
+    hideLoading();
 
+    // 注册自定义控件事件
+    _listen(vidEl, "click", _onVideoClick);
     _listen(vidEl, "play", _updatePlayPauseIcon);
     _listen(vidEl, "pause", _updatePlayPauseIcon);
-    _listen(vidEl, "click", _onVideoClick);
-    _listen(document.getElementById("progress-container"), "click", _onProgressClick);
-    _listen(document.getElementById("progress-container"), "touchstart", _onProgressTouchStart);
-    _listen(document.getElementById("progress-container"), "touchmove", _onProgressTouchMove);
-    _listen(document.getElementById("progress-container"), "touchend", _onProgressTouchEnd);
+    const progressContainer = document.getElementById("progress-container");
+    _listen(progressContainer, "click", _onProgressClick);
+    _listen(progressContainer, "mousedown", _onProgressMouseDown);
+    _listen(progressContainer, "mousemove", _onProgressHover);
+    _listen(progressContainer, "touchstart", _onProgressTouchStart);
+    _listen(progressContainer, "touchmove", _onProgressTouchMove);
+    _listen(progressContainer, "touchend", _onProgressTouchEnd);
     _listen(document, "keydown", _onKeydown);
-
-    // 重置进度条
-    document.getElementById("progress-played").style.width = "0%";
-    document.getElementById("progress-buffered").style.width = "0%";
-    document.getElementById("progress-transcoded").style.width = "0%";
-    document.getElementById("progress-handle").style.left = "0%";
-    document.getElementById("ctrl-time").textContent = "0:00 / " + formatDuration(video.duration);
-    hideLoading();
 
     switchQuality(video.recommended_quality);
     setupTimeDisplay();
+    _loadSprite(video.id);
 }
 
 // ---------- Player State ----------
@@ -753,7 +926,7 @@ const playerState = {
     seekLocked: false,       // 进度条锁定（seek 期间防止 timeupdate 覆盖）
     seekTargetTime: 0,       // 锁定的目标时间
     nativeHls: false,        // Safari 原生 HLS（无 MSE/MMS）
-    nativeControls: false,   // 原生控件模式（Safari <17）
+    nativeControls: false,   // 原生控件模式（所有浏览器）
 };
 
 const SEEK_DEBOUNCE_MS = 300;
@@ -776,7 +949,7 @@ function _resetPlayerState() {
 
 async function _seekTo(targetTime) {
     if (!currentVideo || playerState.seekingInProgress || !playerState.initialSeekDone) return;
-    if (playerState.nativeControls) return; // 原生播放器处理 seek
+    if (playerState.nativeHls) return; // Safari 原生 HLS 自行处理 seek
 
     const video = document.getElementById("video-player");
 
@@ -791,15 +964,18 @@ async function _seekTo(targetTime) {
         }
     }
 
-    // 2. 已转码 → HLS.js 自动拉分片
-    if (targetTime < playerState.maxSeekPosition) {
-        _lockSeek(targetTime);
-        video.currentTime = targetTime;
-        _unlockOnSeeked(video, targetTime);
-        return;
+    // 2. hls.js seekable 范围内 → 直接跳（hls.js 自动拉取对应分片）
+    const sr = video.seekable;
+    for (let i = 0; i < sr.length; i++) {
+        if (targetTime >= sr.start(i) && targetTime <= sr.end(i)) {
+            _lockSeek(targetTime);
+            video.currentTime = targetTime;
+            _unlockOnSeeked(video, targetTime);
+            return;
+        }
     }
 
-    // 3. 未转码 → 转码 + 等待 + 播放
+    // 3. seekable 范围外 → 重载 m3u8
     playerState.seekingInProgress = true;
     showLoading("正在从新位置加载...");
 
@@ -838,6 +1014,7 @@ async function _seekTo(targetTime) {
 }
 
 function _lockSeek(targetTime) {
+    playerState.seekingInProgress = true;
     playerState.seekLocked = true;
     playerState.seekTargetTime = targetTime;
 }
@@ -845,14 +1022,14 @@ function _lockSeek(targetTime) {
 function _unlockOnSeeked(video, targetTime) {
     const onSeeked = () => {
         video.removeEventListener("seeked", onSeeked);
-        // 视频已跳转到目标位置附近，解锁
+        playerState.seekingInProgress = false;
         if (Math.abs(video.currentTime - targetTime) < 2) {
             playerState.seekLocked = false;
         }
     };
     video.addEventListener("seeked", onSeeked);
-    // 安全超时：防止 seeked 事件不触发时永久锁定
     setTimeout(() => {
+        playerState.seekingInProgress = false;
         playerState.seekLocked = false;
     }, 3000);
 }
@@ -930,6 +1107,8 @@ function _createHlsInstance(videoId, quality, options) {
     });
 
     hls.attachMedia(video);
+    // 立即设置 seeking 处理，不等 first fragment
+    video.onseeking = () => handleVideoSeek(video, quality);
     hls.loadSource(url);
 
     if (safetyTimeoutMs > 0) {
@@ -938,7 +1117,6 @@ function _createHlsInstance(videoId, quality, options) {
             if (playerState.seekingInProgress && currentVideo?.id === videoId && !initialized) {
                 playerState.seekingInProgress = false;
                 hideLoading();
-                video.onseeking = () => handleVideoSeek(video, quality);
             }
         }, safetyTimeoutMs);
     }
@@ -1024,8 +1202,8 @@ function switchQuality(quality) {
     playerState.maxSeekPosition = 0;
     hideLoading();
 
-    // 原生控件模式：直接设置 src，保留播放位置
-    if (playerState.nativeControls) {
+    // Safari 原生 HLS：直接设置 src，保留播放位置
+    if (playerState.nativeHls) {
         const currentTime = video.currentTime;
         const wasPlaying = !video.paused;
         video.src = url;
@@ -1039,6 +1217,7 @@ function switchQuality(quality) {
         return;
     }
 
+    // Chrome 等：hls.js + 自定义控件
     if (Hls.isSupported()) {
         _createHlsInstance(videoId, quality, {
             url: url,
@@ -1047,7 +1226,6 @@ function switchQuality(quality) {
                 v.play().catch(() => {});
             },
         });
-        video.onseeking = () => handleVideoSeek(video, quality);
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
         playerState.nativeHls = true;
         video.src = url;
@@ -1066,7 +1244,7 @@ function switchQuality(quality) {
 // ---------- Handle Video Seek ----------
 
 function handleVideoSeek(video, quality) {
-    if (playerState.nativeControls) return;
+    if (playerState.nativeHls) return;
     if (playerState.seekingInProgress || !playerState.initialSeekDone) return;
     const now = Date.now();
     if (now - playerState.lastSeekTime < SEEK_DEBOUNCE_MS) return;
@@ -1077,6 +1255,8 @@ function handleVideoSeek(video, quality) {
 // ---------- Progress Bar & Custom Controls ----------
 
 let _timeUpdateHandler = null;
+let _isDragging = false;
+let _spriteMeta = null;  // {thumb_w, thumb_h, cols, interval, url}
 
 function _updateProgressBar() {
     const video = document.getElementById("video-player");
@@ -1162,28 +1342,107 @@ function _onVideoClick(e) {
 }
 
 function _onProgressClick(e) {
-    if (!currentVideo) return;
+    if (!currentVideo || _isDragging) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     _seekTo(ratio * (currentVideo.duration || 0));
+}
+
+function _onProgressMouseDown(e) {
+    if (!currentVideo) return;
+    e.preventDefault();
+    _isDragging = true;
+    _progressDrag(e);
+    const onMouseMove = (ev) => _progressDrag(ev);
+    const onMouseUp = (ev) => {
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+        _isDragging = false;
+        const container = document.getElementById("progress-container");
+        const rect = container.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+        _seekTo(ratio * (currentVideo.duration || 0));
+    };
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+}
+
+function _loadSprite(videoId) {
+    _spriteMeta = null;
+    const thumb = document.getElementById("tooltip-thumb");
+    if (thumb) { thumb.classList.remove("active"); thumb.style.backgroundImage = ""; }
+    fetch(`/api/video/${encodeURIComponent(videoId)}/sprite`).then(res => {
+        if (!res.ok) return;
+        const w = parseInt(res.headers.get("X-Sprite-Thumb-W") || "160");
+        const h = parseInt(res.headers.get("X-Sprite-Thumb-H") || "90");
+        const cols = parseInt(res.headers.get("X-Sprite-Cols") || "10");
+        const interval = parseInt(res.headers.get("X-Sprite-Interval") || "10");
+        return res.blob().then(blob => {
+            _spriteMeta = { thumb_w: w, thumb_h: h, cols, interval, url: URL.createObjectURL(blob) };
+            const img = new Image();
+            img.onload = () => {
+                _spriteMeta.img_w = img.naturalWidth;
+                _spriteMeta.img_h = img.naturalHeight;
+            };
+            img.src = _spriteMeta.url;
+        });
+    }).catch(() => {});
+}
+
+function _updateTooltip(ratio) {
+    const duration = currentVideo.duration || 0;
+    const time = ratio * duration;
+    const timeEl = document.getElementById("tooltip-time");
+    const thumbEl = document.getElementById("tooltip-thumb");
+    const tooltip = document.getElementById("progress-tooltip");
+    timeEl.textContent = formatDuration(time);
+    tooltip.style.left = (ratio * 100) + "%";
+    if (_spriteMeta && _spriteMeta.url) {
+        const frameIdx = Math.floor(time / _spriteMeta.interval);
+        const col = frameIdx % _spriteMeta.cols;
+        const row = Math.floor(frameIdx / _spriteMeta.cols);
+        const x = -(col * _spriteMeta.thumb_w);
+        const y = -(row * _spriteMeta.thumb_h);
+        thumbEl.style.backgroundImage = `url(${_spriteMeta.url})`;
+        thumbEl.style.backgroundPosition = `${x}px ${y}px`;
+        thumbEl.classList.add("active");
+    }
+}
+
+function _onProgressHover(e) {
+    if (!currentVideo || _isDragging) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    _updateTooltip(ratio);
 }
 
 function _onProgressTouchStart(e) {
     if (!currentVideo) return;
     e.preventDefault();
     const touch = e.touches[0];
+    const container = document.getElementById("progress-container");
+    container.classList.add("touch-active");
     _progressDrag(touch);
+    const rect = container.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+    _updateTooltip(ratio);
 }
 
 function _onProgressTouchMove(e) {
     if (!currentVideo) return;
     e.preventDefault();
-    _progressDrag(e.touches[0]);
+    const touch = e.touches[0];
+    _progressDrag(touch);
+    const container = document.getElementById("progress-container");
+    const rect = container.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
+    _updateTooltip(ratio);
 }
 
 function _onProgressTouchEnd(e) {
     if (!currentVideo) return;
     e.preventDefault();
+    document.getElementById("progress-container").classList.remove("touch-active");
     const touch = e.changedTouches[0];
     const container = document.getElementById("progress-container");
     const rect = container.getBoundingClientRect();
@@ -1203,14 +1462,34 @@ function _progressDrag(touch) {
         formatDuration(ratio * duration) + " / " + formatDuration(duration);
 }
 
+function _enterFs(el) {
+    if (el.requestFullscreen) return el.requestFullscreen();
+    if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
+    return Promise.reject();
+}
+
 function toggleFullscreen() {
     const wrapper = document.querySelector(".player-wrapper");
-    if (!wrapper) return;
-    if (document.fullscreenElement) {
-        document.exitFullscreen();
-    } else {
-        wrapper.requestFullscreen().catch(() => {});
+    const video = document.getElementById("video-player");
+    if (!wrapper || !video) return;
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement;
+    if (isFs) {
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        return;
     }
+    // iOS Safari
+    if (video.webkitEnterFullscreen) {
+        try { video.webkitEnterFullscreen(); } catch (_) {}
+        _tryLockLandscape();
+        return;
+    }
+    // 桌面浏览器
+    _enterFs(wrapper).then(_tryLockLandscape).catch(() => {});
+}
+
+function _tryLockLandscape() {
+    try { screen.orientation?.lock?.("landscape"); } catch (_) {}
 }
 
 function _onKeydown(e) {
@@ -1224,11 +1503,11 @@ function _onKeydown(e) {
             break;
         case "ArrowLeft":
             e.preventDefault();
-            video.currentTime = Math.max(0, video.currentTime - 5);
+            _seekTo(Math.max(0, video.currentTime - 5));
             break;
         case "ArrowRight":
             e.preventDefault();
-            video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+            _seekTo(Math.min(video.duration || 0, video.currentTime + 5));
             break;
         case "f":
             e.preventDefault();
@@ -1302,6 +1581,7 @@ function goBack() {
     _resetPlayerState();
     playerState.maxSeekPosition = 0;
     hideLoading();
+    if (_spriteMeta?.url) { URL.revokeObjectURL(_spriteMeta.url); _spriteMeta = null; }
 
     document.getElementById("player-section").classList.add("hidden");
     document.getElementById("library").classList.remove("hidden");
@@ -1318,6 +1598,7 @@ function goBack() {
 
 // ---------- Init ----------
 
+_applyLang();
 loadVideos();
 checkDiskStatus();
 pollActiveProgress();
