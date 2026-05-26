@@ -56,6 +56,7 @@ const _i18n = {
         batchDone: "批量缓存完成",
         diskWarning: "磁盘空间不足",
         pageOf: "第 {cur} / {total} 页",
+        total: "共",
         settingsMsgSave: "保存成功",
     },
     en: {
@@ -103,6 +104,7 @@ const _i18n = {
         batchDone: "Batch cache complete",
         diskWarning: "Low disk space",
         pageOf: "Page {cur} / {total}",
+        total: "",
         settingsMsgSave: "Settings saved",
     },
 };
@@ -406,20 +408,23 @@ function renderPagination(totalPages, totalItems) {
     const container = document.getElementById("pagination");
     const pageInfo = document.getElementById("page-info");
 
-    const prefix = searchQuery ? `搜索「${searchQuery}」` : "共";
+    const prefix = searchQuery
+        ? (_lang === "zh" ? `搜索「${searchQuery}」` : `Search "${searchQuery}"`)
+        : t("total");
     if (totalItems === 0) {
         container.innerHTML = "";
         pageInfo.textContent = "";
         return;
     }
+    const videosLabel = _lang === "zh" ? `${totalItems} 个视频` : `${totalItems} videos`;
     if (totalPages <= 1) {
         container.innerHTML = "";
-        pageInfo.textContent = `${prefix} ${totalItems} 个视频`;
+        pageInfo.textContent = `${prefix} ${videosLabel}`;
         return;
     }
 
     const pageStr = t("pageOf").replace("{cur}", currentPage).replace("{total}", totalPages);
-    pageInfo.textContent = `${prefix} ${totalItems} · ${pageStr}`;
+    pageInfo.textContent = `${prefix} ${videosLabel} · ${pageStr}`;
 
     let html = "";
     html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(1)" title="首页">&laquo;&laquo;</button>`;
