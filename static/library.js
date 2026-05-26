@@ -424,14 +424,15 @@ function renderPagination(totalPages, totalItems) {
         return;
     }
     const videosLabel = _lang === "zh" ? `${totalItems} 个视频` : `${totalItems} videos`;
+    const base = prefix ? `${prefix} ${videosLabel}` : videosLabel;
     if (totalPages <= 1) {
         container.innerHTML = "";
-        pageInfo.textContent = `${prefix} ${videosLabel}`;
+        pageInfo.textContent = base;
         return;
     }
 
     const pageStr = t("pageOf").replace("{cur}", currentPage).replace("{total}", totalPages);
-    pageInfo.textContent = `${prefix} ${videosLabel} · ${pageStr}`;
+    pageInfo.textContent = `${base} · ${pageStr}`;
 
     let html = "";
     html += `<button ${currentPage === 1 ? "disabled" : ""} onclick="goToPage(1)" title="首页">&laquo;&laquo;</button>`;
