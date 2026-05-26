@@ -138,6 +138,8 @@ function toggleLang() {
     _lang = _lang === "zh" ? "en" : "zh";
     localStorage.setItem("lang", _lang);
     _applyLang();
+    // 重新渲染动态生成的文本
+    if (_lastTotalPages != null) renderPagination(_lastTotalPages, _lastTotalItems);
 }
 
 // ---------- Globals ----------
@@ -404,7 +406,12 @@ function renderLibrary(videos, filteredCount) {
     });
 }
 
+let _lastTotalPages = null;
+let _lastTotalItems = null;
+
 function renderPagination(totalPages, totalItems) {
+    _lastTotalPages = totalPages;
+    _lastTotalItems = totalItems;
     const container = document.getElementById("pagination");
     const pageInfo = document.getElementById("page-info");
 
